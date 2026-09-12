@@ -42,7 +42,7 @@ import sqlite3
 import sys
 import time
 
-from btindex import MIN_SQLITE, expand_text
+from btindex import MIN_SQLITE, expand_text, fts_two_col
 
 BATCH = 20000
 NEW = "torrents_fts_new"
@@ -64,6 +64,24 @@ def table_sql(conn, name):
 def is_contentless(conn, name="torrents_fts"):
     sql = (table_sql(conn, name) or "").replace(" ", "").replace("'", "").replace('"', "")
     return "content=" in sql and "content=torrents" not in sql
+
+
+def needs_migration(conn):
+    """
+    返回这个库还差哪几项。两项互相独立，可能只差一项，也可能两项都差：
+
+      contentless  FTS 还带着一份没人读的正文副本（老结构，费磁盘）
+      twocol       FTS 还是单列 body，名字和文件列表混在一起（排序分不出轻重）
+
+    两项都靠「另建一张表、全库重喂一遍、换掉旧表」来解决，所以一趟做完，
+    不用迁两次。
+    """
+    todo = []
+    if not is_contentless(conn):
+        todo.append("contentless")
+    if not fts_two_col(conn):
+        todo.append("twocol")
+    return todo
 
 
 def part_sizes(conn):
@@ -100,10 +118,15 @@ def migrate(path, go=False, quiet=False):
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-200000")     # 200 MB 页缓存，重建时值回票价
 
-    if is_contentless(conn):
-        print("这个库的 FTS 已经是无正文模式了，不用迁。")
+    todo = needs_migration(conn)
+    if not todo:
+        print("这个库的全文索引已经是最新结构了（无正文 + 名字/文件列表分列），不用迁。")
         conn.close()
         return 0
+    print("这个库要迁的是：%s\n" % "、".join(
+        {"contentless": "去掉没人读的正文副本（省磁盘）",
+         "twocol": "把名字和文件列表分成两列（搜索排序才分得出轻重）"}[t]
+        for t in todo))
 
     total, waste = report(conn, path)
     if not go:
@@ -114,13 +137,19 @@ def migrate(path, go=False, quiet=False):
 
     # 续跑：新表已经建到哪一条了
     done_to = 0
+    if table_sql(conn, NEW) and not fts_two_col(conn, NEW):
+        # 上次是用更早的版本迁到一半的，那张半成品是单列的，接不上。
+        # 扔掉重来——它还没被任何人用过（换表是最后一步），扔掉不损失什么
+        print("\n发现上次留下的半成品新表是旧结构（单列），丢掉重建。")
+        conn.execute("DROP TABLE %s" % NEW)
+        conn.commit()
     if table_sql(conn, NEW):
         done_to = conn.execute(
             "SELECT COALESCE(MAX(rowid),0) FROM %s" % NEW).fetchone()[0]
         print("\n发现上次没迁完的新表，从 rowid %s 接着来。" % format(done_to, ","))
     else:
         conn.execute(
-            "CREATE VIRTUAL TABLE %s USING fts5(body, tokenize='unicode61', "
+            "CREATE VIRTUAL TABLE %s USING fts5(name, files, tokenize='unicode61', "
             "content='', contentless_delete=1)" % NEW)
         conn.commit()
         print("\n新表建好了。旧表先留着，搜索这期间照常能用。")
@@ -141,13 +170,13 @@ def migrate(path, go=False, quiet=False):
         payload = []
         for r in rows:
             name, fl = r["name"] or "", r["filelist"] or ""
-            # 拼法必须和 btindex.upsert 里一模一样，差一个空格，
+            # 拼法必须和 btindex.fts_write 里一模一样，差一个空格，
             # 迁完的库搜出来的东西就和迁之前不一样了
-            payload.append((r["rowid"], "%s %s %s %s"
-                            % (name, expand_text(name), fl, expand_text(fl))))
+            payload.append((r["rowid"], "%s %s" % (name, expand_text(name)),
+                            "%s %s" % (fl, expand_text(fl))))
         with conn:
             conn.executemany(
-                "INSERT INTO %s(rowid, body) VALUES (?,?)" % NEW, payload)
+                "INSERT INTO %s(rowid, name, files) VALUES (?,?,?)" % NEW, payload)
         done_to = rows[-1]["rowid"]
         moved += len(rows)
         if not quiet:

@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from btcompat import setup_console
 from btprune import pad
 from btindex import DB_DEFAULT, human
+import btparse
 import btpeers
 import btprune
 
@@ -220,6 +221,27 @@ def step_overview(args):
     return run
 
 
+def step_parse(args):
+    """
+    把还没解析过名字的条目补上。
+
+    平时这一步什么也不做——新条目入库时就解析好了。它存在是为了两种情况：
+    一是从旧版升上来、库里堆着一批没解析过的；
+    二是解析规则改过（PARSE_VERSION 变了），全库需要按新规则重来一遍。
+    两种情况都不用人操心，每周维护跑到就顺手补了。
+    """
+    def run():
+        r = btparse.backfill(args.db, progress=None)
+        if r["added"]:
+            print("已给索引补上列：%s" % "、".join(r["added"]))
+        if not r["todo"]:
+            print("都解析过了，跳过。")
+            return
+        print("解析了 %s 条，其中 %s 条的值有变化。"
+              % (format(r["done"], ","), format(r["changed"], ",")))
+    return run
+
+
 def step_verify(args):
     def run():
         btprune.cmd_verify(SimpleNamespace(db=args.db, fix=True, backup=None))
@@ -288,6 +310,8 @@ def main():
     ap.add_argument("--recheck", type=int, default=14,
                     help="多少天内测过的就跳过（默认 14）")
     ap.add_argument("--no-verify", action="store_true", help="跳过一致性检查")
+    ap.add_argument("--no-parse", action="store_true",
+                    help="跳过「把没解析过的条目补上分类和清晰度」这一步")
 
     ap.add_argument("--prune-dead", action="store_true",
                     help="删掉「实测没人在传」且「很久没再出现」的")
@@ -334,6 +358,10 @@ def main():
             r.step("体检", step_overview(args))
             if not args.no_verify:
                 r.step("修复索引一致性", step_verify(args))
+            if not args.no_parse:
+                # 放在实测前面：解析不联网、跑得快，而实测那一步动辄几分钟，
+                # 排在后面万一被掐了，前面这步已经落盘了
+                r.step("解析名字", step_parse(args))
             if args.scan > 0:
                 r.step("实测做种情况", step_scan(args))
             if args.prune_dead:

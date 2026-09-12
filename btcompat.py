@@ -30,7 +30,7 @@ import os
 import socket
 import sys
 
-BUILD = "2026-09-11-s"          # 版本戳，用来确认跑的是哪一版
+BUILD = "2026-09-12-h"          # 版本戳，用来确认跑的是哪一版
 IS_WINDOWS = os.name == "nt"
 
 

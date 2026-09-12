@@ -137,6 +137,91 @@ The cost is real: prefixes widen the hit set, and bm25 has to score every hit (s
 
 ---
 
+## Name hits outrank file-list hits
+
+The FTS index has **two columns** — the torrent name (plus its CJK bigrams) and the file list
+(plus its bigrams). Both are searched; ranking weights the name column **10× higher**.
+
+This came out of a measurement, not a preference. With everything in one column, searching
+`matrix` returned this:
+
+```
+Dev Tools Pack 0        ← no "matrix" in the name, just bin/matrix.dll in the file list
+Dev Tools Pack 1
+...
+```
+
+`The Matrix 1999 1080p BluRay x264-CHD` did not make the top ten. bm25 was not wrong — it
+normalises by document length, and `Dev Tools Pack 0` plus two short file names is much shorter
+than a movie name carrying a tail of technical tokens, so it scored better. Split into two columns
+with weights, the same query returns the actual films first.
+
+Chinese names never had the problem: bigram expansion already makes the name field heavy enough.
+The fix matters for Latin and mixed names.
+
+The weight is not a sensitive parameter: 2.0 already flips the ordering and anything from 2 to 30
+produces an identical top ten. It also does not bury genuine collections whose file list matches —
+those were already last, sunk by length normalisation, weight or no weight.
+
+**`bm25()` accepts more weights than the table has columns and ignores the extras.** That is what
+keeps this cheap: `bm25(torrents_fts, 10.0, 1.0)` runs unchanged against a legacy one-column
+index, where the surplus weight is dropped and the remaining one scales every row equally, leaving
+the order untouched. Only the write path needs to know the table shape. Existing databases keep
+working as they are; `btmigrate.py` converts them, and both `btcheck.py` and `btprune.py analyze`
+say which shape a database has.
+
+Two columns cost about **3% more on disk** (200k rows: 75.1 MB single-column, 77.4 MB split) —
+the inverted index carries position data per column.
+
+---
+
+## Fields parsed from the torrent name
+
+A torrent name is a string somebody typed, not data:
+
+```
+Some.Show.S02E07.2160p.WEB-DL.DDP5.1.HDR.H.265-GROUP
+[SubGroup] Some Anime [12][1080p]
+```
+
+Everything useful is in there — category, resolution, season and episode, year, source, codec —
+but only as words. Full-text search already finds those words, so indexing them again buys
+nothing. What search *cannot* express is the part that has no word: there is no token meaning
+"this is a TV series."
+
+`btparse.py` normalises exactly two of these into stored columns:
+
+| Column | Values |
+|---|---|
+| `kind` | `movie`, `tv`, `video`, `music`, `game`, `software`, `book`, `''` (unrecognised) |
+| `res` | `2160p`, `1080p`, `720p`, `480p`, `''` |
+
+**Only these two, and the criterion is normalisation.** 4K / UHD / 2160p / 3840x2160 are the same
+thing written four ways that no keyword query unifies — a column does. `tv` is not a word at all
+— it has to be inferred. Year, season/episode, source and codec are parsed too, but they are
+*displayed only*: a year is already its own token, so `2019` and `year=2019` return the same rows,
+and a second copy is just a second truth to keep in sync.
+
+Classification prefers hard evidence. If ≥70% of the recognised file extensions are `.flac`, it is
+music regardless of the name; accompanying files (subtitles, cover art, `.nfo`) never vote. Names
+are consulted only when the file list is absent or undecided — which is the common case for
+Torznab imports, since that protocol returns no file list at all.
+
+`parsed` stores the **rule version** used, not a boolean. Bumping `PARSE_VERSION` is what makes a
+backfill re-derive stale rows without rescanning everything.
+
+```
+python btparse.py try "Some.Show.S02E07.1080p.WEB-DL.x265-GRP"
+python btparse.py test                    # 37 rule cases; also wired into btcheck.py
+python btparse.py backfill --db bt.db     # existing rows; new rows are parsed on write
+python btparse.py sample --db bt.db -n 30 # names next to what was extracted, to spot mistakes
+```
+
+The rules are heuristics over human-typed strings and they will misfire. `sample` exists because
+self-chosen test cases always pass — only a real library exposes the spellings nobody thought of.
+
+---
+
 ## Measured performance
 
 Not estimates. Benchmarked on a single database built to 5 million rows.
@@ -230,6 +315,7 @@ plainly; `--deep` removes the bound on the CLI.
 | `dhtsniff.py` | DHT node that collects infohashes from `get_peers` / `announce_peer` traffic |
 | `dhtmeta.py` | BEP 9 metadata fetch — turns an infohash into a name and file list; `--sniff` runs the full pipeline |
 | `btindex.py` | Storage and retrieval (SQLite + FTS5, CJK bigrams) |
+| `btparse.py` | Derives category, resolution, season/episode, year, source and codec from torrent names; carries its own rule cases |
 | `btimport.py` | Bulk import from Jackett/Prowlarr (Torznab), Internet Archive, Academic Torrents, local `.torrent` files |
 | `btenrich.py` | Refetches metadata from the DHT for entries that arrived without a file list |
 | `bttasks.py` | Process management behind the task panel — command lines are assembled from fixed templates, never concatenated |
@@ -239,13 +325,114 @@ plainly; `--deep` removes the bound on the CLI.
 | `btprune.py` | Index maintenance: health report, dead-entry pruning, FTS repair, VACUUM |
 | `btmaint.py` | Scheduled-task entry point that chains the above |
 | `btcompat.py` | Cross-platform layer (Windows console encoding, SQLite URIs, socket options) |
-| `btmigrate.py` | One-shot migration of an existing database to a contentless FTS index (~47% smaller) |
+| `btmigrate.py` | One-shot FTS rebuild: contentless index (~47% smaller) and name/files column split; handles either or both in a single pass |
 | `make_test_torrents.py` | Generates structurally valid `.torrent` fixtures, including tokenizer edge cases |
 | `btcheck.py` | Environment and self-consistency checks |
 
 ---
 
 ## Implementation notes
+
+**Swarm liveness has three states, not two.** `peers = -1` means never measured; `0` means
+measured and nobody was there. Collapsing them would make the UI report "dead" where it means
+"unknown" — the one distinction a user actually needs. The filter is `peers > 0`, never `>= 0`,
+and the JSON API returns `-1` verbatim rather than folding it to `0` for the caller.
+
+**`SCHEMA` runs before the column top-up, so it must not reference late-added columns.**
+`peers` and `checked_at` arrive via `CREATE TABLE` on new databases and via `ALTER TABLE` in
+`ensure_columns()` on existing ones, but `Index.__init__` executes `SCHEMA` first. A
+`CREATE INDEX ... ON torrents(peers)` inside `SCHEMA` therefore fails with `no such column` on
+every existing database while working perfectly on new ones — the hardest kind of bug to notice.
+Those indexes are created at the end of `ensure_columns()` instead, unconditionally and
+idempotently. `kind` / `res` / `parsed` follow the same rule; their definition and indexes live in
+`btparse.ensure_parse_columns()`, which `btindex.ensure_columns()` calls — **one definition, one
+place**, after `peers` nearly drifted from being written out twice.
+
+**Filtering by liveness makes common-term queries faster, not slower.** Rows rejected by
+`peers > 0` never reach the sorter, so `bm25()` is never computed for them. On a 200k-row
+database, `1080p` (≈50k matches) takes 0.058–0.107 s unfiltered and a steady 0.026 s with the
+filter on. The filter is a performance lever aimed squarely at the slowest class of query. The
+category filter behaves the same way: on a 200k-row set where `1080p` matches 140k rows, 0.145 s
+unfiltered, 0.104 s restricted to `tv`, 0.029 s restricted to `music`.
+
+**Group header items by kind; do not let the browser break the row wherever it runs out of
+width.** The filter controls and the header actions used to share one row.
+When it filled up, the two actions wrapped onto a line of their own and the layout looked broken.
+The problem was not the wrap — it was that the row mixed two kinds of thing: five dropdowns that
+pick a value, then a navigation link and a mode toggle. The browser breaks purely on remaining
+width, so the break lands somewhere arbitrary. Now the control row holds filters only and the
+actions sit at the right end of the stats line, which was empty on that side anyway — no extra
+vertical space, one row fewer. The liveness checkbox is a toggle rather than a dropdown, so
+`margin-left:auto` parks it at the end of the row, aligned with the actions below it; when the
+width runs out it drops to its own line still right-aligned, which reads as placed rather than
+spilled. The site-name row is gone entirely — navigation moved next to the submit button as a
+button of the same size and style, and the name now lives only in the tab title and for screen
+readers. Header height: 238px to 176px. That nav button does one thing — go to the task panel. It
+is not a toggle that renames itself per page: getting back to the list is what the search button
+already does, from anywhere. Same reasoning as the deleted "browse all" link.
+
+A related trap: the global `a:hover{text-decoration:underline}` has specificity (0,1,1) and beats
+`text-decoration:none` declared on `.go` (0,1,0). **When a button is an anchor, repeat
+`text-decoration:none` in its `:hover` rule**, or an underline appears inside the button on hover.
+`.go:hover` is (0,2,0) and holds.
+
+**A button that is only a shortcut for another path probably should not exist.** The header used
+to carry a "browse all" link pointing at a hardcoded `/?q=`. Submitting an empty search box does
+the same thing — and does it better, because it keeps the current filters while the link silently
+dropped them. Two affordances that look identical and behave differently are worse than one
+affordance. It is gone; the landing page says in one sentence that an empty search browses
+everything.
+
+Related: **a `select` is as wide as its longest option**, so the wording of the "any" option drives
+the width of the whole row. "All categories" / "Any resolution" / "All sources" all became simply
+"any" — each dropdown already carries its own label, so repeating the category inside the option
+was redundant, and the width saved is what lets the checkbox stay on the same line.
+
+**A page header is state, not decoration.** Search, detail and the task panel share one
+`page()` function, but only the search route ever passed the full set of arguments; the other two
+passed a title, a body and the stats. Every filter control in their headers therefore rendered
+empty: the source dropdown held one option, the category and resolution dropdowns did not render
+at all (they are gated on `show_parse`), and the search box lost the query. **Controls that are
+present, look usable and are silently all-defaults are worse than controls that are absent** — and
+nothing raises an error, so it takes an eyeball to catch.
+
+The same mistake happened twice, so the second fix was not another patch: header state now has a
+single home, `Handler.header_state()`, called by all three routes. Adding a control means editing
+one function, not remembering three call sites. The state also travels through links — result rows
+and the "task panel" nav link both carry the current filter set, so moving between pages preserves
+it. The link back to `/` does not need it: that route replays `LAST_VIEW`, page number included.
+
+**There can be only one place that builds the indexed body.** Name and file list are composed
+into FTS rows in three places: `btindex.upsert`, the repair path in `btprune`, and the rebuild in
+`btmigrate`. One extra space in any of them and the rows it writes rank differently from every
+other row — silently. They now all call `btindex.fts_write()`, which also knows whether this
+database wants one column or two.
+
+**An index on a filter column needs the sort column in it too.** Browse-all sorts by
+`last_seen`, so the query is `WHERE kind=? ORDER BY last_seen DESC LIMIT 26`. SQLite has two
+options — seek `idx_kind` then sort, or walk `idx_last_seen` and test `kind` per row — and it
+picks the second, because that one needs no sort. For a common category this is fine, twenty-odd
+rows fill a page; **for a rare category it walks the whole index**. On 200k rows, filtering to a
+category holding 5 rows took 0.058 s, and that number grows linearly with the table. A composite
+`(kind, last_seen)` index turns the same query into one seek plus a sequential read:
+**0.058 s to 0.00004 s**, flat in table size. It also subsumes the single-column index —
+`WHERE kind=?` and `GROUP BY kind` both ride it as a covering index — so it is a replacement, not
+an addition. Same treatment for `(res, last_seen)`.
+
+**Every filter must cross all three paths: search, count, delete.** The results list, the
+"N matches" count behind the delete button, and `delete_by_filter` have to see the same set.
+Miss one and the page lists 12 rows while the button deletes 400, irreversibly. With two
+conditions this was maintained by hand; at five (size, source, liveness, category, resolution) it
+would not have survived, so the predicate now has a single home in `filter_clauses()` that all
+three call.
+
+**One field, one source of truth — including in the JSON API.** `kind` and `res` live in the
+database because that is what filtering reads; year, season/episode, source and codec are derived
+per request. An early version returned the whole parse result under `parsed`, so `kind` appeared
+twice in one response — and the two can disagree whenever rules have changed but a backfill has
+not run. `parsed` now carries only the fields that are *not* stored. The same rule governs the UI:
+row badges show the stored category and resolution, never a fresh re-parse, or you get an entry
+labelled "movie" that the movie filter cannot find.
 
 **`ORDER BY` can silently discard your range predicate.** The single-character LIKE fallback is
 bounded with `rowid > MAX - 500000`, but the first version did nothing: `ORDER BY t.hits DESC`

@@ -41,7 +41,7 @@ import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from btcompat import db_uri, py_cmd, setup_console
-from btindex import DB_DEFAULT, expand_text, human, parse_size
+from btindex import DB_DEFAULT, fts_two_col, fts_write, human, parse_size
 
 BAR = "▇"
 
@@ -171,13 +171,12 @@ def fix_consistency(conn) -> dict:
         rows = conn.execute(
             "SELECT t.rowid, t.name, t.filelist FROM torrents t WHERE NOT EXISTS "
             "(SELECT 1 FROM torrents_fts f WHERE f.rowid = t.rowid)").fetchall()
+        # 索引正文的拼法必须和 btindex.upsert 里完全一致，否则补回去的这些条目
+        # 搜出来的结果会和别的不一样。所以这里不自己拼，调 btindex 那一个函数——
+        # 它同时知道该写一列还是两列（老库是单列 body）
+        two = fts_two_col(conn)
         for r in rows:
-            # 索引正文的拼法必须和 btindex.upsert 里完全一致，
-            # 否则补回去的这些条目搜出来的结果会和别的不一样
-            body = "%s %s %s %s" % (r["name"], expand_text(r["name"]),
-                                    r["filelist"], expand_text(r["filelist"]))
-            conn.execute("INSERT INTO torrents_fts(rowid, body) VALUES (?,?)",
-                         (r["rowid"], body))
+            fts_write(conn, r["rowid"], r["name"], r["filelist"], two)
         fixed["missing"] = len(rows)
     return fixed
 
@@ -306,6 +305,15 @@ def cmd_analyze(args):
             print("  缺索引 %d 条 —— 这些种子搜不出来，跑 verify --fix 补" % c["missing"])
         if c["dup"]:
             print("  重复条目 %d 条 —— 搜索结果会重复" % c["dup"])
+
+    # 全文索引的结构。这不是错，老结构照常能搜，只是排序分不出
+    # 「名字里就叫这个」和「文件列表里提了一嘴」的轻重
+    print("\n全文索引结构")
+    if fts_two_col(conn):
+        print("  名字和文件列表分两列，搜索时名字的权重是文件列表的十倍。")
+    else:
+        print("  还是老的单列结构 —— 能搜，但排序分不出名字命中和文件列表命中。")
+        print("  迁过来：btmigrate.py --db %s（先不加 --go 看估算）" % args.db)
 
     # 给个保守建议，而不是替用户做决定
     # 按来源分开给建议。last_seen 和 hits 只对爬虫抓的条目有意义：

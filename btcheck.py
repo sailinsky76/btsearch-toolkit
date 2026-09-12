@@ -80,6 +80,16 @@ def run_child(argv, cwd, timeout=30):
 BUILTIN_NAMES = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "self", "cls"}
 
 
+def _parse_case_count(here):
+    """用例有多少条，只为了在 OK 那行显示个数。取不到就当 0，不让它影响自检。"""
+    sys.path.insert(0, here)
+    try:
+        import btparse
+        return len(btparse.CASES)
+    except Exception:
+        return 0
+
+
 def _visible_names(tree):
     names = set()
     for n in ast.walk(tree):
@@ -164,6 +174,24 @@ def scan_bat_flags(here):
             if missing:
                 problems.append((os.path.basename(bat), script, missing))
     return problems
+
+
+def check_parse_rules(here):
+    """
+    跑一遍名字解析的用例。
+
+    这些规则是「名字长什么样」的经验，没有编译器帮着看，改一条正则很容易
+    捎带打翻另一条——上一版里「合集」被当成剧集信号，结果音乐专辑合集
+    一路被判成剧集，中间没有任何一步报错。用例跑得很快（几十条，毫秒级），
+    放进自检里，改完规则至少有人吭声。
+    """
+    sys.path.insert(0, here)
+    try:
+        import btparse
+    except ImportError as e:
+        return ["btparse 导不进来：%s" % e]
+    return ["%s 的 %s：期望 %r，实际 %r" % (name[:40], key, want, got)
+            for name, key, want, got in btparse.selftest()]
 
 
 def check_inline_js(here):
@@ -345,11 +373,18 @@ def main():
     db = os.path.join(here, "bt.db")
     if os.path.exists(db):
         try:
-            c = sqlite3.connect(db)
-            n, size = c.execute(
+            c2 = sqlite3.connect(db)
+            n, size = c2.execute(
                 "SELECT count(*), COALESCE(SUM(size),0) FROM torrents").fetchone()
-            c.close()
-            check("已有索引", True, "bt.db 里有 %s 条种子" % format(n, ","))
+            detail = "bt.db 里有 %s 条种子" % format(n, ",")
+            try:
+                cols = {r[1] for r in c2.execute("PRAGMA table_info(torrents_fts)")}
+                if not ("name" in cols and "files" in cols):
+                    detail += "（全文索引还是老的单列结构，跑 migrate-fts.bat 能让排序更准）"
+            except sqlite3.Error:
+                pass
+            check("已有索引", True, detail)
+            c2.close()
         except sqlite3.Error as e:
             check("已有索引", False, "bt.db 读不了：%s" % e)
     else:
@@ -362,6 +397,9 @@ def main():
 
     guard("网页脚本", lambda: check_inline_js(here),
           "字符串字面量都闭合", fatal=True)
+
+    guard("名字解析规则", lambda: check_parse_rules(here),
+          "%d 条用例全过" % _parse_case_count(here))
 
     guard("命令行选项位置", lambda: check_cli_flags(here),
           "选项写在子命令前后都接受")

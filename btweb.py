@@ -35,7 +35,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from btcompat import BUILD, db_uri, py_cmd, setup_console
-from btindex import DB_DEFAULT, Index, build_match, human, magnet, parse_size
+from btindex import (BM25, DB_DEFAULT, Index, build_match, human, magnet,
+                     parse_size)
+from btparse import (CODEC_TEXT, KIND_LABEL, KIND_TEXT, MEDIUM_TEXT,
+                     PARSE_VERSION, RES_LABEL, describe, parse as parse_name,
+                     se_text)
 
 PER_PAGE = 25
 MAX_LIMIT = 100
@@ -58,16 +62,63 @@ HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 # 和 btindex 里的排序保持一致。这里没有复用它的 search()，
 # 是因为那个方法只能在可写连接上跑，而且不支持翻页；
 # 但查询表达式一定要用它的 build_match——入库展开和查询展开必须同一套规则。
+# BM25 里带着「名字比文件列表重十倍」那组权重，定义在 btindex，
+# 命令行和网页共用一个——两边排序不一样是最难发现的那种不一致
 ORDER_SQL = {
-    "relevance": "bm25(torrents_fts), t.hits DESC",
-    "hits":      "t.hits DESC, bm25(torrents_fts)",
+    "relevance": "%s, t.hits DESC" % BM25,
+    "hits":      "t.hits DESC, %s" % BM25,
     "size":      "t.size DESC",
     "date":      "t.last_seen DESC",
+    # 未测的是 -1，排在 0 后面，正好沉底——不用额外写 WHERE 排除它们
+    "peers":     "t.peers DESC, t.hits DESC",
 }
 ORDER_LABEL = [("relevance", "相关度"), ("hits", "热度"),
-               ("size", "体积"), ("date", "最近出现")]
-SIZE_LABEL = [("", "不限"), ("100MB", "100 MB 以上"), ("1GB", "1 GB 以上"),
-              ("5GB", "5 GB 以上"), ("20GB", "20 GB 以上")]
+               ("size", "体积"), ("date", "最近出现"), ("peers", "做种数")]
+# 没有关键词时 FTS 表压根不参与查询，bm25 算不出来，这两项得换个说法。
+# 「相关度」整个退成按最近出现——没有查询词就没有相关度可言。
+# 「热度」只去掉兜底的 bm25，主排序键还是 hits。
+#
+# 以前这里是一句「ORDER BY 里含 bm25 就整条换成 date」。它把热度也一起换了：
+# 浏览时选热度拿到的是按时间排的结果，而下拉和结果说明都还写着「热度」。
+# 按 key 走就不会再出这种事——想知道某个排序在没有关键词时是什么样，
+# 到这张表里找，不用去读一句字符串判断
+NOFTS_ORDER = {"relevance": ORDER_SQL["date"], "hits": "t.hits DESC"}
+
+
+def effective_sort(sort, query):
+    """
+    真正生效的排序键。
+
+    没有关键词时相关度退成最近出现，这件事有三个地方要知道：查询本身、
+    结果上面那行「按 X 排序」、还有排序下拉怎么显示。三处各判一次，
+    迟早会对不上——上面 NOFTS_ORDER 的注释里写的就是对不上之后的样子。
+    """
+    return "date" if (not query and sort == "relevance") else sort
+
+# 写「≥ 1 GB」而不是「1 GB 以上」：select 的宽度取决于最长的那个选项，
+# 省下来的是整排控件的横向空间。意思一样清楚，而且比中文后缀更紧凑
+SIZE_LABEL = [("", "不限"), ("100MB", "≥ 100 MB"), ("1GB", "≥ 1 GB"),
+              ("5GB", "≥ 5 GB"), ("20GB", "≥ 20 GB")]
+
+# 分类和清晰度这两个下拉。取值由 btparse 定义，这里只管怎么显示。
+# 「未识别」需要一个自己的取值：库里存的是空串，而空串在 URL 里
+# 和「没选这个筛选」长得一模一样，分不开。用一个短横当哨兵。
+NONE_KIND = "-"
+# 空值一律写「不限」。每个下拉前面都有自己的标签（分类 / 清晰度 / 来源），
+# 再把类别名写进选项里是重复的，而且 select 的宽度取决于最长的那个选项——
+# 「清晰度不限」这种写法白白把整排控件撑宽，挤得筛选条换行。
+# 体积那个下拉本来就是「不限」，其余三个跟它对齐。
+KIND_OPTS = [("", "不限")] + KIND_LABEL + [(NONE_KIND, "未识别")]
+RES_OPTS = [("", "不限")] + RES_LABEL
+KIND_OK = {v for v, _ in KIND_OPTS if v}
+RES_OK = {v for v, _ in RES_OPTS if v}
+
+# 做种数是有保质期的：三个月前测出来有 40 个人，今天可能一个都不剩。
+# 超过这个时长就在界面上标成「旧」，别让人把陈年数字当成现在的情况。
+PEERS_STALE = 14 * 86400
+# 需要 peers / checked_at 两列才能开的功能（排序项、筛选项、结果行上那一格）。
+# 老库缺这两列时整块功能收起来，而不是让页面报 no such column
+PEERS_SORT = "peers"
 
 
 # --------------------------------------------------------------------------
@@ -76,6 +127,8 @@ SIZE_LABEL = [("", "不限"), ("100MB", "100 MB 以上"), ("1GB", "1 GB 以上")
 
 _local = threading.local()
 DB_PATH = [DB_DEFAULT]      # 启动时定下来，后台线程要靠它自己开连接
+_HAS_PEERS = [None]         # 探测一次就记住，见 has_peers()
+_HAS_PARSE = [None]         # 同上，kind / res 两列在不在
 
 
 def conn_for(path):
@@ -172,25 +225,53 @@ def cached(key, ttl, fn):
     return ent[0]
 
 
+def filter_clauses(min_size=0, source="", alive=False, kind="", res="", p="t."):
+    """
+    筛选条件只有这一个出处。
+
+    README 里那条规矩写得很直白：**任何筛选条件都要同时穿过搜索、计数、删除
+    三条路**，漏掉 delete_by_filter 的后果是页面列 12 条、点删除删掉 400 条，
+    而且不可逆。上一轮加「只看还有人做种的」时是三处各写一遍 WHERE，
+    靠人记着同步；这一轮条件从两个涨到四个，再靠记就是迟早的事。
+    三处现在都调这一个函数，想漏也漏不掉。
+
+    p 是列前缀：搜索那条路的表带别名 t，计数和删除直接查 torrents 不带别名。
+    """
+    where, params = [], []
+    if min_size:
+        where.append("%ssize >= ?" % p)
+        params.append(min_size)
+    if source:
+        where.append("%ssource = ?" % p)
+        params.append(source)
+    if alive:
+        # -1 是「没测过」，不能算进来——那等于拿不知道当还活着
+        where.append("%speers > 0" % p)
+    if kind:
+        where.append("%skind = ?" % p)
+        params.append("" if kind == NONE_KIND else kind)
+    if res:
+        where.append("%sres = ?" % p)
+        params.append(res)
+    return where, params
+
+
 def do_search(conn, query, page=1, sort="relevance", min_size=0, per_page=PER_PAGE,
-              source=""):
+              source="", alive=False, kind="", res=""):
     """
     多取一条用来判断有没有下一页，比 COUNT(*) 便宜太多。
 
     没给关键词时走「浏览全部」：直接查主表，不经过 FTS。
     相关度排序在没有查询词时没有意义，自动退成按最近出现排。
+
+    筛选条件（体积、来源、还有人做种、分类、清晰度）一律走 filter_clauses，
+    跟计数和删除共用同一份判据。
     """
     # 单字查询 FTS 够不着，和 btindex.search 走同一套 LIKE 回退，
     # 否则会出现命令行搜得到、网页搜不到的割裂
     single_char = bool(query) and Index.needs_like(query)
     match = "" if single_char else (build_match(query) if query else "")
-    where, params = [], []
-    if min_size:
-        where.append("t.size >= ?")
-        params.append(min_size)
-    if source:
-        where.append("t.source = ?")
-        params.append(source)
+    where, params = filter_clauses(min_size, source, alive, kind, res)
 
     if match:
         where.insert(0, "torrents_fts MATCH ?")
@@ -215,9 +296,7 @@ def do_search(conn, query, page=1, sort="relevance", min_size=0, per_page=PER_PA
                 # 明说，不能让人以为搜的是全库。
                 where.insert(0, "t.rowid > (SELECT MAX(rowid) FROM torrents) - %d"
                                 % LIKE_WINDOW)
-        order = ORDER_SQL.get(sort, ORDER_SQL["date"])
-        if "bm25" in order:            # 没有 FTS 参与时相关度无从谈起
-            order = ORDER_SQL["date"]
+        order = NOFTS_ORDER.get(sort) or ORDER_SQL.get(sort, ORDER_SQL["date"])
         if single_char:
             # 这个加号不是笔误，少了它上面那扇窗等于没开。
             # ORDER BY t.hits DESC 会诱使 SQLite 走 idx_hits 从头扫整个索引、
@@ -286,7 +365,8 @@ def delete_by_hashes(path, hashes):
         conn.close()
 
 
-def delete_by_filter(path, query, min_size=0, source=""):
+def delete_by_filter(path, query, min_size=0, source="", alive=False,
+                     kind="", res=""):
     """
     按当前筛选条件删除。「全选删除全部」走的是这条——
     几万条逐个勾选不现实，也不该把上万个 infohash 塞进请求体。
@@ -296,18 +376,14 @@ def delete_by_filter(path, query, min_size=0, source=""):
     结果是 FTS 没了、主表还在——数据变成搜不到的僵尸行，而且返回的删除数是 0，
     表面上看像什么都没发生。所以先把命中的 rowid 落到临时表，再照着它删两张表。
     """
-    where, params = [], []
+    # 判据跟 do_search / count_by_filter 共用一份，见 filter_clauses 的说明。
+    # 这里查的是 torrents 本身，没有表别名，所以前缀传空
+    where, params = filter_clauses(min_size, source, alive, kind, res, p="")
     match = build_match(query) if query else ""
     if match:
-        where.append("rowid IN (SELECT rowid FROM torrents_fts "
-                     "WHERE torrents_fts MATCH ?)")
-        params.append(match)
-    if min_size:
-        where.append("size >= ?")
-        params.append(min_size)
-    if source:
-        where.append("source = ?")
-        params.append(source)
+        where.insert(0, "rowid IN (SELECT rowid FROM torrents_fts "
+                        "WHERE torrents_fts MATCH ?)")
+        params.insert(0, match)
     cond = (" WHERE " + " AND ".join(where)) if where else ""
 
     conn = sqlite3.connect(path, timeout=20)
@@ -349,19 +425,14 @@ def delete_by_filter(path, query, min_size=0, source=""):
         conn.close()
 
 
-def count_by_filter(conn, query, min_size=0, source=""):
-    where, params = [], []
+def count_by_filter(conn, query, min_size=0, source="", alive=False,
+                    kind="", res=""):
+    where, params = filter_clauses(min_size, source, alive, kind, res, p="")
     match = build_match(query) if query else ""
     if match:
-        where.append("rowid IN (SELECT rowid FROM torrents_fts "
-                     "WHERE torrents_fts MATCH ?)")
-        params.append(match)
-    if min_size:
-        where.append("size >= ?")
-        params.append(min_size)
-    if source:
-        where.append("source = ?")
-        params.append(source)
+        where.insert(0, "rowid IN (SELECT rowid FROM torrents_fts "
+                        "WHERE torrents_fts MATCH ?)")
+        params.insert(0, match)
     cond = (" WHERE " + " AND ".join(where)) if where else ""
     # 数到上限就收手。这个数只用来写「删除当前筛选的全部 N 条」这句话，
     # 而为了这句话去数穿整张表是不划算的：600 万条的库里搜 1080p 命中 45 万条，
@@ -403,6 +474,34 @@ def list_sources(conn):
             else with_own_conn(_list_sources_raw)
     except sqlite3.Error:
         return []
+
+
+def _facet_raw(conn, col):
+    """某一列的取值分布。走 idx_kind_seen / idx_res_seen 的覆盖扫描，不碰主表。"""
+    try:
+        return {(r[0] or ""): r[1] for r in conn.execute(
+            "SELECT %s, count(*) FROM torrents GROUP BY %s" % (col, col))}
+    except sqlite3.Error:
+        return {}
+
+
+def facet_counts(conn, col):
+    """
+    分类 / 清晰度下拉旁边那个条数。
+
+    和来源下拉同一套：小库实算，大库走 stale-while-revalidate 缓存。
+    数的是**全库**而不是当前筛选下的条数——后者每换一个筛选都要重数一遍，
+    而这个数字的用处是「库里有多少剧集」，不是「在当前筛选里有多少」。
+    """
+    known = (_CACHE.get("stats") or [None])[0]
+    if (known or {}).get("count", 0) > STATS_CACHE_FROM:
+        return cached("facet_" + col, STATS_TTL,
+                      lambda: with_own_conn(lambda c: _facet_raw(c, col))) or {}
+    try:
+        return _facet_raw(conn, col) if conn is not None \
+            else with_own_conn(lambda c: _facet_raw(c, col))
+    except sqlite3.Error:
+        return {}
 
 
 def _stats_raw(conn):
@@ -450,6 +549,115 @@ def get_stats(conn, path):
     out = dict(s)
     out["db_size"] = on_disk
     return out
+
+
+def has_peers(conn):
+    """
+    这个库有没有 peers / checked_at 两列。
+
+    结果缓存在进程里：表结构在服务活着的这段时间不会变——加列要写，
+    而网页是只读打开的，加不了。有必要重新探测就重启服务，比每页查一次
+    PRAGMA 划算。
+
+    缺列不是错误，是「还没跑过任何要写库的工具」。这种库上整块做种数功能
+    收起来：不出排序项、不出筛选项、结果行上也不留那一格。
+    """
+    if _HAS_PEERS[0] is None:
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(torrents)")}
+            _HAS_PEERS[0] = "peers" in cols and "checked_at" in cols
+        except sqlite3.Error:
+            _HAS_PEERS[0] = False
+    return _HAS_PEERS[0]
+
+
+def has_parse(conn):
+    """
+    这个库有没有 kind / res 两列。缺列的理由和 has_peers 一样：
+    没跑过任何写库的工具。这种库上两个下拉和结果行上的标签一起收起来，
+    而不是让页面报 no such column。
+
+    注意「有这两列」不等于「解析过」：全是空串的库（列刚补上、还没回填）
+    筛选出来会是零条。那种情况下界面上会给一句话说去哪儿补，见 page_search。
+    """
+    if _HAS_PARSE[0] is None:
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(torrents)")}
+            _HAS_PARSE[0] = "kind" in cols and "res" in cols
+        except sqlite3.Error:
+            _HAS_PARSE[0] = False
+    return _HAS_PARSE[0]
+
+
+def not_parsed(conn):
+    """
+    库里还有没有没解析过名字的条目。
+
+    只问「有没有」，不数有多少：LIMIT 1 走 idx_parsed 是常数时间，
+    一亿条的库上也是一瞬。这个问题只在筛选筛出零条时才问一次，
+    用来分清「真的没有这类东西」和「还没回填，分类是空的」——
+    这两种情况在页面上长得一模一样，但该做的事完全不同。
+    """
+    try:
+        return conn.execute("SELECT 1 FROM torrents WHERE parsed < ? LIMIT 1",
+                            (PARSE_VERSION,)).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def peers_cell(peers, checked_at):
+    """
+    结果行上那一格。三种状态必须看得出区别：
+
+      未测   从来没查过，不知道有没有人   —— 不是「没人」
+      没人   查过，当时一个 peer 都没有   —— 死种
+      N 人   查过，当时有这么多人
+
+    后两种都跟上「多久前测的」。一个三个月前的数字和今天的数字在界面上
+    长得一样，是在骗人。
+    """
+    if peers is None or peers < 0:
+        return '<span class="pz" title="还没实测过做种情况">做种 未测</span>'
+    stale = checked_at and (time.time() - checked_at) > PEERS_STALE
+    when = ago(checked_at) if checked_at else "时间不明"
+    cls = "pz" if peers == 0 else ("pw" if stale else "pk")
+    text = "没人做种" if peers == 0 else "%d 人" % peers
+    return ('<span class="%s" title="%s实测">%s<i>·%s</i></span>'
+            % (cls, esc(when), esc(text), esc(when)))
+
+
+def tags_cell(row):
+    """
+    结果行上那一小串标签：分类 · 清晰度 · 季集 · 年份 · 片源 · 编码。
+
+    前两个取自库里的列（筛选用的就是它们，显示和筛选必须是同一个值，
+    否则会出现「标着电影、按电影筛却筛不到」）；后面几个是现算的——
+    它们不进库，名字在手就能算，一条二十几微秒，一页二十五条不到一毫秒。
+
+    代价说清楚：解析规则改了以后，列里的值要等回填才更新，而现算的那几个
+    立刻就变了。所以同一行上短时间内可能出现「新规则认出的片源」配
+    「旧规则存下的分类」。回填一跑就一致了，而 parsed 那一列就是用来
+    知道该不该跑回填的。
+    """
+    bits = []
+    kind = row.get("kind") or ""
+    if kind:
+        bits.append(KIND_TEXT.get(kind, kind))
+    if row.get("res"):
+        bits.append(row["res"])        # 行里要短，写 2160p 而不是「4K / 2160p」
+    d = parse_name(row.get("name") or "", "")
+    se = se_text(d["season"], d["episode"])
+    if se:
+        bits.append(se)
+    if d["year"]:
+        bits.append(str(d["year"]))
+    if d["medium"]:
+        bits.append(MEDIUM_TEXT.get(d["medium"], d["medium"]))
+    if d["codec"]:
+        bits.append(CODEC_TEXT.get(d["codec"], d["codec"]))
+    if not bits:
+        return ""
+    return '<span class="tags">%s</span>' % esc(" · ".join(bits))
 
 
 def has_any_rows(conn):
@@ -624,8 +832,14 @@ def browse_dir(path):
             "counted": not at_root}
 
 
+# 这些参数取默认值时不写进链接：?sort=relevance 和不写是一回事，
+# 写了只是让地址变长、也更难一眼看出这一屏到底筛了什么
+QS_DEFAULT = {"sort": "relevance", "page": 1}
+
+
 def qs(**kw):
-    clean = {k: v for k, v in kw.items() if v not in ("", None, 1)}
+    clean = {k: v for k, v in kw.items()
+             if v not in ("", None) and v != QS_DEFAULT.get(k)}
     return ("?" + urllib.parse.urlencode(clean)) if clean else "/"
 
 
@@ -689,9 +903,11 @@ header{
   background:var(--surface); border-bottom:1px solid var(--line);
   padding:20px 0 16px; position:sticky; top:0; z-index:5;
 }
-h1{margin:0 0 14px;font-size:13px;font-weight:600;letter-spacing:.02em;color:var(--muted)}
-h1 a{color:var(--ink)}
-a.nav{font-size:12.5px;font-weight:500;margin-left:12px;color:var(--accent)}
+/* 站名只留给屏幕阅读器和标签页标题。它在视觉上不承担任何信息——
+   这是一台单用途的仪器，不需要每页顶上都写一遍自己叫什么 */
+.sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
 form{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 input[type=search]{
   flex:1 1 280px; min-width:0; height:46px; padding:0 16px;
@@ -707,33 +923,56 @@ input[type=search]::placeholder{color:var(--faint)}
 /* 排序/体积这一排要自己占一行，否则宽屏上会被挤到搜索框右边，
    和搜索按钮抢视觉重心 */
 .controls{
-  flex:0 0 100%; display:flex; gap:10px; align-items:center;
+  flex:0 0 100%; display:flex; gap:8px; align-items:center;
   margin-top:12px; flex-wrap:wrap;
 }
-.controls label{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
-a.browseall{font-size:12.5px;align-self:center;margin-left:2px}
+.controls label{display:flex;gap:5px;align-items:center;font-size:12px;color:var(--muted)}
+/* 勾选框顶到行尾。它和五个下拉不是一类东西——那五个是「选一个值」，
+   这个是开关——所以给它一段间距把两组分开。
+   附带好处：宽度不够时它单独落到下一行，落点仍然在右端，
+   看着是摆过去的而不是挤下去的 */
+.controls label.chk{margin-left:auto}
 /* 内边距常驻，激活时只填底色不改尺寸，否则整排控件会横向抖一下。
-   标签在「编辑列表 / 退出编辑」之间换，都是四个字，宽度不变 */
+   标签在「编辑列表 / 退出编辑」之间换，都是四个字，宽度不变。
+
+   静止时用 --faint，和统计行正文同一个灰度。原来这里是 --accent：
+   一整行灰字里只有最右端一个带色的东西，眼睛必然先往那儿去，
+   而这个按钮承担的信息量配不上那个权重——旁边搜索按钮已经是一块饱和的青，
+   这排再来一块就是两个主控件在抢。它是个低频动作，安安静静待着就行，
+   要找的时候它还在原地 */
 button.editlist{
-  font-size:12.5px; padding:3px 8px; border-radius:5px; margin-left:-4px;
-  background:none; border:0; color:var(--accent); font-family:inherit; cursor:pointer;
+  font-size:12.5px; padding:3px 8px; border-radius:5px; margin-right:-8px;
+  background:none; border:0; color:var(--faint); font-family:inherit; cursor:pointer;
 }
-button.editlist:hover{background:var(--accent-soft)}
+/* 伸手够它的时候才上色。键盘走到这儿也给同样的反馈——
+   全局那条 :focus-visible 只给一圈描边，颜色上的变化两种输入方式该一致 */
+button.editlist:hover,
+button.editlist:focus-visible{color:var(--accent); background:var(--accent-soft)}
 /* 激活态用淡底加一圈内描边，不用实心强调色。旁边就是搜索按钮，
    那里已经有一块饱和的青了，这排再来一块会变成两个主按钮在抢。
    状态主要由文案承担，底色只是跟着点头。
-   描边走 inset box-shadow 而不是 border，免得多出 2px 把整排推歪 */
+   描边走 inset box-shadow 而不是 border，免得多出 2px 把整排推歪。
+   颜色这里要显式写：底色已经变成 accent-soft，字还留在 --faint 就成了
+   淡底上的浅灰，对比度掉到读不清 */
 button.editlist[aria-pressed="true"]{
+  color:var(--accent);
   background:var(--accent-soft); box-shadow:inset 0 0 0 1px var(--accent);
 }
+/* 统计行：左边一组信息，右边一组动作。
+   右边那组用 margin-left:auto 顶到头，而不是给左边定宽——
+   统计项的条数会变（空库少两项），定宽的话右边就跟着飘 */
 .meta{
   color:var(--faint); font-size:11.5px; margin-top:12px;
-  display:flex; gap:20px; flex-wrap:wrap;
+  display:flex; gap:14px; align-items:center; flex-wrap:wrap;
 }
+.mstats{display:flex; gap:20px; align-items:center; flex-wrap:wrap}
+.macts{margin-left:auto; display:flex; gap:14px; align-items:center}
+/* 窄屏上整组落到下一行时，仍然靠右，看着是有意为之而不是被挤下去的 */
+.macts a{white-space:nowrap}
 
 /* ── 表单控件统一成一套 ── */
 select,.ctl input[type=text],.ctl input[type=number],.mag input{
-  height:34px; padding:0 10px; font-size:13px; font-family:inherit;
+  height:34px; padding:0 8px; font-size:13px; font-family:inherit;
   color:var(--ink); background:var(--surface);
   border:1px solid var(--line); border-radius:6px;
 }
@@ -742,12 +981,21 @@ select:focus,.ctl input:focus,.mag input:focus{
   outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft);
 }
 button{font-family:inherit}
-button.go{
+/* 按类选，不按标签选：页头上的「任务」是个链接，但要和「搜索」这个
+   button 长得一模一样。链接默认是 inline，得自己把盒子摆平（flex 居中、
+   去下划线），否则同样的 height 和 padding 出来的高度对不上 */
+.go{
   height:46px; padding:0 22px; font-size:14.5px; font-weight:600; cursor:pointer;
   color:var(--accent-ink); background:var(--accent); border:0; border-radius:var(--r);
+  display:inline-flex; align-items:center; justify-content:center;
+  text-decoration:none; font-family:inherit; white-space:nowrap;
 }
-button.go:hover{filter:brightness(1.08)}
-.ctl button.go{height:34px;padding:0 16px;font-size:13px;border-radius:6px}
+/* 这里的 text-decoration 不能省。全局有一条 a:hover{text-decoration:underline}，
+   它的优先级（0,1,1）压得过 .go 里那句 text-decoration:none（0,1,0），
+   所以不在 :hover 上再写一遍的话，鼠标一放上去按钮里就冒出条下划线。
+   .go:hover 是（0,2,0），压得住 */
+.go:hover{filter:brightness(1.08); text-decoration:none}
+.ctl .go{height:34px;padding:0 16px;font-size:13px;border-radius:6px}
 button.ghost2{background:none;color:var(--accent);border:1px solid var(--accent)}
 button.danger{
   height:34px; padding:0 14px; font-size:13px; font-weight:500; cursor:pointer;
@@ -803,6 +1051,16 @@ ol.results li:hover{background:var(--hover);border-left-color:var(--accent-soft)
   border-radius:2px; overflow:hidden; vertical-align:middle;
 }
 .heat i{display:block;height:100%;background:var(--accent)}
+/* 做种数三态。颜色只用来区分「有人 / 没人 / 不知道」这三件事，
+   别再往上叠含义——这一行已经够挤了。
+   .pk 有人（强调色）  .pw 有人但数据旧了（暗一档）  .pz 没人 / 未测（最淡） */
+.pk{color:var(--accent); font-weight:600}
+.pw{color:var(--muted)}
+.pz{color:var(--faint)}
+.pk i,.pw i,.pz i{font-style:normal; font-weight:400; color:var(--faint); margin-left:4px}
+/* 从名字里解析出来的那一串。比文件数、时间这些实测信息弱一档——
+   它是推断出来的，不该和事实抢注意力 */
+.tags{color:var(--faint)}
 .copy{cursor:pointer;color:var(--accent);background:none;border:0;padding:0;font:inherit}
 /* 勾选框默认不占位。display:none 而不是 visibility，
    这样标题的左缘在非选择状态下是齐的，列表扫读不被打断 */
@@ -824,6 +1082,8 @@ body.selmode .tools{display:flex}
 .tools .all{color:var(--muted);display:flex;gap:7px;align-items:center;cursor:pointer}
 #delmsg{color:var(--muted);font-size:12px}
 .browsehead{color:var(--faint);font-size:11.5px;margin:14px 0 0}
+/* 详情页顶上那个「回到结果」。只在带着筛选点进来时才出现 */
+a.backlink{font-size:12.5px}
 .pager{display:flex;gap:18px;padding:22px 0 44px;font-size:13.5px}
 
 /* ── 空状态是给方向的地方 ── */
@@ -980,7 +1240,7 @@ pre.log{
 @media (max-width:620px){
   .wrap{padding:0 14px}
   input[type=search]{height:42px;font-size:16px}
-  button.go{height:42px}
+  .go{height:42px}
   .row1{flex-wrap:wrap;gap:4px}
   .size{font-size:12.5px}
   dl{grid-template-columns:1fr;gap:2px 0}
@@ -1106,7 +1366,8 @@ document.addEventListener('click', function(e){
                  + '不只是本页。删除后无法撤销。')) return;
     if (!confirm('再确认一次：真的要删除' + what + '？')) return;
     post({mode:'filter', q: meta('filter-q'), min: meta('filter-min'),
-          src: meta('filter-src')});
+          src: meta('filter-src'), alive: meta('filter-alive'),
+          kind: meta('filter-kind'), res: meta('filter-res')});
   });
   refresh();
 })();
@@ -1301,7 +1562,11 @@ document.addEventListener('keydown', function(e){
 
 
 def page(title, body, q="", sort="relevance", minsz="", stats=None,
-         sources=(), src="", editable=False):
+         sources=(), src="", editable=False, alive=False, show_peers=False,
+         kind="", res="", show_parse=False, kind_counts=None, res_counts=None,
+         back="", nav="search"):
+    kind_counts = kind_counts or {}
+    res_counts = res_counts or {}
     # 编辑入口只在「这一页真有行可编辑」时才出现。空库、无匹配、详情页、
     # 任务面板都不给，按了也没东西可选
     edit_btn = ('<button id="selmode" class="editlist" type="button" '
@@ -1310,25 +1575,91 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
         '<option value="%s"%s>%s</option>'
         % (esc(v), " selected" if v == cur else "", esc(label))
         for v, label in items)
+    # 老库缺 peers / checked_at 时，「做种数」这一项和下面那个勾选框一起收起来。
+    # 给一个选了也没用的选项，比不给更让人困惑
+    #
+    # 没有关键词时「相关度」实际按最近出现排（见 effective_sort），下拉写着
+    # 「相关度」而结果上面那行写着「按最近出现排序」，两处自相矛盾，
+    # 看着像有一边坏了。这里把标签换掉：「默认」不声称按什么排，
+    # 那行说明负责讲清楚眼下退成了什么。
+    # 只换标签不换 value——真提交成 date，下次打个关键词搜索就是按时间排，
+    # 相关度排序会从此消失在默认路径上，那是比这行矛盾更贵的代价
+    order_label = [(v, "默认" if (v == "relevance" and not q) else label)
+                   for v, label in ORDER_LABEL if show_peers or v != PEERS_SORT]
+    alive_box = ('<label class="chk"><input type="checkbox" name="alive" value="1"%s>'
+                 ' 只看还有人做种的</label>' % (" checked" if alive else "")
+                 ) if show_peers else ""
+    # 老库缺 kind / res 时这两个下拉一起收起来，理由同上
+    kind_sel = res_sel = ""
+    if show_parse:
+        # 带上条数。空值那一项（「全部分类」）不写数——它等于顶栏已经有的总数
+        def opts_n(items, cur, counts, none_key=""):
+            # 库里一条都没有的档次不列出来，和来源下拉一个规矩：
+            # 给一个选了必然是零条的选项，比不给更让人困惑。
+            # 唯一的例外是当前选中的那个——它得留着，否则 URL 里的状态
+            # 在界面上就没有对应项了，看起来像筛选凭空消失
+            out = []
+            for v, label in items:
+                n = counts.get(none_key if v == NONE_KIND else v, 0)
+                if v and not n and v != cur:
+                    continue
+                text = label if not v else "%s（%s）" % (label, format(n, ","))
+                out.append('<option value="%s"%s>%s</option>'
+                           % (esc(v), " selected" if v == cur else "", esc(text)))
+            return "".join(out)
+        kind_sel = ('<label>分类 <select name="kind">%s</select></label>'
+                    % opts_n(KIND_OPTS, kind, kind_counts))
+        res_sel = ('<label>清晰度 <select name="res">%s</select></label>'
+                   % opts_n(RES_OPTS, res, res_counts))
 
-    bar = ""
+    # 统计信息这一行：左边是「库里有什么」，右边是动作。
+    #
+    # 动作原来跟六个筛选控件挤在同一排，那排一满就换行，换出来的那一行只有
+    # 「浏览全部 编辑列表」两个，看着像排版塌了。真正的问题不是换行，
+    # 而是那一排混了两类东西——前面六个是筛选条件，后面两个一个是导航、
+    # 一个是模式开关，浏览器只按剩余宽度决定在哪儿断，断点必然随机。
+    # 按性质分行之后，筛选控件之间换行是自然的，而动作有了固定的位置。
+    # 统计那行右边本来就是空的，所以这么挪不多占一行高度，反而少了一行。
+    bits = []
     if stats:
         bits = ["库里 %s 条" % format(stats["count"], ",")]
         if stats["count"]:
             bits.append("内容总量 %s" % human(stats["total_size"]))
             bits.append("最近更新 %s" % ago(stats["newest"]))
         bits.append("数据库 %s" % human(stats["db_size"]))
-        bar = '<div class="meta">%s</div>' % "".join(
-            "<span>%s</span>" % esc(b) for b in bits)
+    acts = []
+    if back:
+        acts.append('<a class="backlink" href="%s">← 回到结果</a>' % esc(back))
+    if edit_btn:
+        acts.append(edit_btn)
+    bar = ('<div class="meta"><div class="mstats">%s</div>'
+           '<div class="macts">%s</div></div>'
+           % ("".join("<span>%s</span>" % esc(b) for b in bits), "".join(acts)))
 
     # 始终渲染来源筛选。库为空时 sources 是空的，以前整个下拉就不出现了，
     # 界面看起来像少了个筛选项。
-    opts_src = '<option value="">全部来源</option>' + "".join(
+    opts_src = '<option value="">不限</option>' + "".join(
         '<option value="%s"%s>%s（%s）</option>'
         % (esc(name), " selected" if name == src else "",
            esc(name or "未标"), format(n, ","))
         for name, n in sources)
     src_sel = '<label>来源 <select name="src">%s</select></label>' % opts_src
+
+    # 去任务面板的链接把当前筛选一起带过去，回来时页头还是原样。
+    # 回来的那个「本地搜索」链接不用带：它指向 /，而 / 会用 LAST_VIEW
+    # 把人送回上一次真正看过的那一屏，连页码都在
+    task_qs = qs(q=q, sort=sort, min=minsz, src=src, kind=kind, res=res,
+                 alive="1" if alive else "")
+    task_qs = "" if task_qs == "/" else task_qs
+    # 导航只有一个按钮，固定写「任务」，固定去任务面板——它只有这一个功能，
+    # 不做成随页面换名字的切换键。回列表不需要它：旁边那个搜索按钮就是，
+    # 在任务面板上按一下（搜索框留空或者填个词）就回到列表了。
+    #
+    # 在任务面板上它指向当前这一页，点了相当于刷新。视觉上不做区分——
+    # 页头在每一页都长得一样是更要紧的事——但标上 aria-current，
+    # 用读屏的人才知道自己已经在这儿了。
+    nav_html = ('<a class="go" href="/tasks%s"%s>任务</a>'
+                % (esc(task_qs), ' aria-current="page"' if nav == "tasks" else ""))
 
     return """<!doctype html>
 <html lang="zh-CN"><head>
@@ -1338,20 +1669,25 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
 <meta name="filter-q" content="%s">
 <meta name="filter-min" content="%s">
 <meta name="filter-src" content="%s">
+<meta name="filter-alive" content="%s">
+<meta name="filter-kind" content="%s">
+<meta name="filter-res" content="%s">
 <title>%s</title><link rel="stylesheet" href="/style.css?v=%s">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head><body>
 <header><div class="wrap">
-  <h1><a href="/">本地搜索</a> <a class="nav" href="/tasks">任务面板</a></h1>
+  <h1 class="sr">本地搜索</h1>
   <form action="/" method="get" role="search">
     <input type="search" name="q" value="%s" placeholder="搜什么，中英文都行，按 / 聚焦"
            autocomplete="off" autofocus maxlength="%d">
     <button class="go" type="submit">搜索</button>
+    %s
     <div class="controls">
       <label>排序 <select name="sort">%s</select></label>
       <label>体积 <select name="min">%s</select></label>
       %s
-      <a class="browseall" href="/?q=">浏览全部</a>
+      %s
+      %s
       %s
     </div>
   </form>
@@ -1359,24 +1695,33 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
 </div></header>
 <main class="wrap">%s</main>
 <script src="/app.js"></script>
-</body></html>""" % (esc(CSRF[0]), esc(q), esc(minsz), esc(src),      # 四个 meta
-                     esc(title), BUILD, esc(q), MAX_QUERY,            # title、样式版本、搜索框
-                     opts(ORDER_LABEL, sort), opts(SIZE_LABEL, minsz), src_sel,
-                     edit_btn, bar, body)
+</body></html>""" % (esc(CSRF[0]), esc(q), esc(minsz), esc(src),      # 七个 meta
+                     "1" if alive else "", esc(kind), esc(res),
+                     esc(title), BUILD,                               # title、样式版本
+                     esc(q), MAX_QUERY, nav_html,                     # 搜索框、导航
+                     opts(order_label, sort), opts(SIZE_LABEL, minsz),
+                     kind_sel, res_sel, src_sel,
+                     alive_box, bar, body)
 
 
 def render_results(rows, q, page_no, has_next, sort, minsz, src="",
-                   total_matching=0, count_capped=False, can_delete=True):
+                   total_matching=0, count_capped=False, can_delete=True,
+                   alive=False, show_peers=False, kind="", res="",
+                   show_parse=False):
+    # 详情页链接上挂着当前这一屏的筛选。算一次，所有行共用
+    detail_qs = qs(q=q, sort=sort, min=minsz, src=src, kind=kind, res=res,
+                   alive="1" if alive else "", page=page_no)
+    detail_qs = "" if detail_qs == "/" else detail_qs
     items = []
     for r in rows:
         link = magnet(r["infohash"], r["name"])
         items.append(
             '<li><div class="row1">'
             '%s'
-            '<span class="name"><a href="/t/%s">%s</a></span>'
+            '<span class="name"><a href="/t/%s%s">%s</a></span>'
             '<span class="size">%s</span></div>'
             '<div class="row2">'
-            '<span>%d 个文件</span><span>%s</span>'
+            '%s<span>%d 个文件</span><span>%s</span>%s'
             '<span class="heat" title="被 announce %d 次"><i style="width:%d%%"></i></span>'
             '<span class="hash">%s</span>'
             '<a href="%s">打开磁力链</a>'
@@ -1384,18 +1729,22 @@ def render_results(rows, q, page_no, has_next, sort, minsz, src="",
             '</div></li>'
             % (('<input type="checkbox" class="pick" value="%s" aria-label="选中">'
                 % esc(r["infohash"])) if can_delete else "",
-               esc(r["infohash"]), esc(r["name"]), esc(human(r["size"])),
+               esc(r["infohash"]), esc(detail_qs), esc(r["name"]),
+               esc(human(r["size"])),
+               tags_cell(r) if show_parse else "",
                r["nfiles"], esc(ago(r["last_seen"])),
+               peers_cell(r.get("peers"), r.get("checked_at")) if show_peers else "",
                r["hits"], heat_width(r["hits"]),
                esc(r["infohash"][:16]), esc(link), esc(link)))
 
     pager = []
+    # 翻页要把当前所有筛选条件都带上，少带一个就是「翻到第二页筛选没了」
+    keep = dict(q=q, sort=sort, min=minsz, src=src, kind=kind, res=res,
+                alive="1" if alive else "")
     if page_no > 1:
-        pager.append('<a href="%s">← 上一页</a>'
-                     % esc(qs(q=q, sort=sort, min=minsz, src=src, page=page_no - 1)))
+        pager.append('<a href="%s">← 上一页</a>' % esc(qs(page=page_no - 1, **keep)))
     if has_next:
-        pager.append('<a href="%s">下一页 →</a>'
-                     % esc(qs(q=q, sort=sort, min=minsz, src=src, page=page_no + 1)))
+        pager.append('<a href="%s">下一页 →</a>' % esc(qs(page=page_no + 1, **keep)))
 
     bar = ""
     if can_delete:
@@ -1436,8 +1785,8 @@ EMPTY_DB = """<div class="empty">
 # 空手进来（地址栏就是一个 /，没带任何查询串）时给的页面。
 # 一上来就把整库铺开，既慢又没给人任何方向感；这里只留两条路。
 LANDING = """<div class="empty">
-<p>上面搜点什么，中英文都行。想先看看库里都有什么，点<a href="/?q=">浏览全部</a>，
-   或者搜索框留空直接搜，两者是一回事。</p>
+<p>上面搜点什么，中英文都行。想先看看库里都有什么，<b>搜索框留空直接按搜索</b>
+   就是整库翻一遍，上面那排筛选照样管用。</p>
 <p>往里加内容去<a href="/tasks">任务面板</a>，本地扫描、Jackett 导入、DHT 爬虫都在那儿。</p>
 </div>"""
 
@@ -1547,18 +1896,53 @@ TASK_PAGE = """
   <h2>维护</h2>
   <p class="note">整理磁盘需要独占数据库，跑之前先停掉爬虫。
      「补全文件列表」是给 Jackett 导入的条目用的 —— Torznab 协议不提供文件列表，
-     这一步用 infohash 去 DHT 把真实元数据取回来补上。</p>
+     这一步用 infohash 去 DHT 把真实元数据取回来补上。
+     「解析名字」把名字里的分类和清晰度拆出来存成列，之后才筛得了 ——
+     新进来的条目入库时就解析好了，这个按钮是给升级前就在库里的老条目补的，
+     跑一次就够，不用联网。</p>
   <div class="ctl actions">
     <button class="go ghost2" data-maint="analyze" type="button">体检</button>
     <button class="go ghost2" data-maint="verify" type="button">修复索引一致性</button>
     <button class="go ghost2" data-maint="vacuum" type="button">整理磁盘空间</button>
     <button class="go ghost2" data-maint="peers" type="button">实测做种情况</button>
     <button class="go ghost2" data-maint="enrich" type="button">补全文件列表</button>
+    <button class="go ghost2" data-maint="parse" type="button">解析名字</button>
     <button class="danger ghost" data-stop="maint" type="button">停止</button>
   </div>
   <pre class="log" id="log_maint">未运行</pre>
 </div>
 """
+
+
+def peers_line(r):
+    """详情页上的一行。比结果行那一格宽裕，可以把话说完整。"""
+    peers = r.get("peers", -1)
+    if peers is None or peers < 0:
+        return ('还没测过 —— 到<a href="/tasks">任务面板</a>点「实测做种情况」，'
+                '它会去 DHT 上真查一遍')
+    when = ago(r.get("checked_at") or 0) if r.get("checked_at") else "时间不明"
+    if peers == 0:
+        return ('<b>%s</b>测的时候一个人都没有，多半是死种' % esc(when))
+    stale = r.get("checked_at") and (time.time() - r["checked_at"]) > PEERS_STALE
+    tail = "，这个数已经旧了，值得重测" if stale else ""
+    return "%s实测有 <b>%d</b> 个 peer%s" % (esc(when), peers, tail)
+
+
+def parse_line(r):
+    """
+    详情页上那一行。分类和清晰度用库里的值（和筛选是同一个来源），
+    其余现算。两边都没认出东西就说一句实话，别留个空白让人以为坏了。
+    """
+    d = parse_name(r.get("name") or "", r.get("filelist") or "")
+    if r.get("kind"):
+        d = dict(d, kind=r["kind"])
+    if r.get("res"):
+        d = dict(d, res=r["res"])
+    text = describe(d)
+    if not text:
+        return ('名字里没认出什么可用的字段。这很正常——名字是人随手拼的，'
+                '规则只认常见写法。')
+    return esc(text)
 
 
 def render_detail(r):
@@ -1584,7 +1968,7 @@ def render_detail(r):
         '可以用 infohash 去 DHT 把真实元数据取回来。</p>')
     note = ""
     if files and len(files) < r["nfiles"]:
-        note = ('<p style="color:var(--dim);font-size:12px;margin:10px 0 0">'
+        note = ('<p style="color:var(--muted);font-size:12px;margin:10px 0 0">'
                 '共 %d 个文件，索引只保留了前 %d 个。</p>' % (r["nfiles"], len(files)))
     return """<div class="detail">
 <h2>%s</h2>
@@ -1596,13 +1980,16 @@ def render_detail(r):
 <dt>体积</dt><dd>%s</dd>
 <dt>文件数</dt><dd>%d</dd>
 <dt>被 announce</dt><dd>%d 次</dd>
+<dt>做种情况</dt><dd>%s</dd>
+<dt>名字里认出</dt><dd>%s</dd>
 <dt>首次见到</dt><dd>%s</dd>
 <dt>最近见到</dt><dd>%s</dd>
 <dt>来源</dt><dd>%s</dd>
 <dt>infohash</dt><dd class="hash">%s</dd>
 </dl>
 %s%s</div>""" % (esc(r["name"]), cover, esc(link), esc(link), esc(human(r["size"])),
-                 r["nfiles"], r["hits"], esc(ago(r["first_seen"])),
+                 r["nfiles"], r["hits"], peers_line(r), parse_line(r),
+                 esc(ago(r["first_seen"])),
                  esc(ago(r["last_seen"])), esc(r["source"] or "未知"),
                  esc(r["infohash"]), table, note)
 
@@ -1685,9 +2072,16 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if payload.get("mode") == "filter":
+                # 这几个值要和页面上那次筛选完全一致，所以校验规则也一模一样：
+                # 白名单外的一律当没填。松一点的后果不是查不到，而是删错东西
+                k = str(payload.get("kind", ""))[:16]
+                rs = str(payload.get("res", ""))[:8]
                 n = delete_by_filter(self.db_path, payload.get("q", "")[:MAX_QUERY],
                                      _safe_size(payload.get("min", "")),
-                                     str(payload.get("src", ""))[:32])
+                                     str(payload.get("src", ""))[:32],
+                                     payload.get("alive") == "1",
+                                     k if k in KIND_OK else "",
+                                     rs if rs in RES_OK else "")
             else:
                 hashes = payload.get("hashes") or []
                 if not isinstance(hashes, list) or len(hashes) > 5000:
@@ -1764,15 +2158,16 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/search":
                 return self.api_search(one)
             if route == "/tasks":
+                # 页头和搜索页一样是一整套控件，所以这里也走 header_state。
+                # 任务面板上没有列表可筛，但页头上的搜索框和下拉照样能用——
+                # 在这儿填个词按回车就直接搜过去了，控件是空壳的话这条路就断了
+                _, common = self.header_state(conn_for(self.db_path), one)
                 if not TASKS[0]:
                     return self.reply(page("任务", '<div class="empty"><p>'
-                        '任务面板已关闭（启动时加了 --no-tasks）。</p></div>'), code=403)
-                try:
-                    st = get_stats(conn_for(self.db_path), self.db_path)
-                except sqlite3.Error:
-                    st = None          # 库还没建好也不该挡住任务面板
+                        '任务面板已关闭（启动时加了 --no-tasks）。</p></div>',
+                        nav="tasks", **common), code=403)
                 body = TASK_PAGE.replace("{{DB}}", esc(os.path.abspath(self.db_path)))
-                return self.reply(page("任务 — 本地搜索", body, stats=st))
+                return self.reply(page("任务 — 本地搜索", body, nav="tasks", **common))
             if route == "/api/task/status":
                 if not TASKS[0]:
                     return self.reply_json({"tasks": {}})
@@ -1787,7 +2182,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as e:
                     return self.reply_json({"error": str(e)}, 400)
             if route.startswith("/t/"):
-                return self.page_detail(route[3:])
+                return self.page_detail(route[3:], one)
             self.reply(page("找不到", '<div class="empty"><p>没有这个页面。'
                             '<a href="/">回到搜索</a></p></div>'), code=404)
         except sqlite3.OperationalError as e:
@@ -1818,12 +2213,55 @@ class Handler(BaseHTTPRequestHandler):
             page_no = max(1, min(int(one("page", "1")), MAX_PAGE))
         except ValueError:
             page_no = 1
-        return q, sort, minsz, min_bytes, page_no, one("src")[:32]
+        alive = one("alive") == "1"
+        # 分类和清晰度只认白名单里的取值。不认的当没填——
+        # 这两个值会拼进 WHERE，虽然走的是参数绑定，但白名单让
+        # 「?kind=随便什么」返回全部而不是零条，对人更友好
+        kind = one("kind")[:16]
+        kind = kind if kind in KIND_OK else ""
+        res = one("res")[:8]
+        res = res if res in RES_OK else ""
+        return (q, sort, minsz, min_bytes, page_no, one("src")[:32], alive,
+                kind, res)
+
+    def header_state(self, conn, one):
+        """
+        页头那一整套状态，只有这一个出处。
+
+        页头不是装饰，是一组有值的控件：搜索框里的词、四个下拉的选项和选中项、
+        做种勾选框。每条路各自拼一遍的话，漏传一个的后果不是报错，是那个控件
+        **静默变成空壳或者干脆不渲染**——而它看着还像能用。
+        这个 bug 在详情页和任务面板上各犯了一次，都是同一个原因。
+
+        返回 (筛选参数, 给 page() 的一整包关键字参数)。
+        新加控件时改这一个函数，三条路一起就位。
+        """
+        q, sort, minsz, min_bytes, page_no, src, alive, kind, res = self._params(one)
+        show_peers = has_peers(conn)
+        show_parse = has_parse(conn)
+        alive = alive and show_peers
+        if not show_parse:
+            kind = res = ""
+        if sort == PEERS_SORT and not show_peers:
+            sort = "relevance"
+        try:
+            st = get_stats(conn, self.db_path)
+        except sqlite3.Error:
+            st = None              # 库还没建好也不该挡住页面
+        common = dict(q=q, sort=sort, minsz=minsz, stats=st,
+                      sources=list_sources(conn), src=src, alive=alive,
+                      show_peers=show_peers, kind=kind, res=res,
+                      show_parse=show_parse,
+                      kind_counts=facet_counts(conn, "kind") if show_parse else {},
+                      res_counts=facet_counts(conn, "res") if show_parse else {})
+        return (q, sort, minsz, min_bytes, page_no, src, alive, kind, res), common
 
     def page_search(self, one, has_query=True):
-        q, sort, minsz, min_bytes, page_no, src = self._params(one)
         conn = conn_for(self.db_path)
-        st = get_stats(conn, self.db_path)
+        (q, sort, minsz, min_bytes, page_no, src, alive, kind,
+         res), common = self.header_state(conn, one)
+        st = common["stats"] or {"count": 0, "total_size": 0, "newest": None}
+        show_peers, show_parse = common["show_peers"], common["show_parse"]
 
         editable = False
         # 判空不走缓存里的 count。刚导完数据那会儿缓存还是旧的，
@@ -1841,17 +2279,42 @@ class Handler(BaseHTTPRequestHandler):
         else:
             # 记下这一眼看的是什么，下次空手回到 / 就送回这里。
             # 搜索和浏览一视同仁，都是「我当时在看的东西」
-            LAST_VIEW[0] = qs(q=q, sort=sort, min=minsz, src=src, page=page_no)
+            LAST_VIEW[0] = qs(q=q, sort=sort, min=minsz, src=src, kind=kind,
+                              res=res, alive="1" if alive else "", page=page_no)
             rows, has_next = do_search(conn, q, page_no, sort, min_bytes,
-                                       source=src)
+                                       source=src, alive=alive, kind=kind, res=res)
             if rows:
+                # 这个数有两处要用：浏览模式那行说明，和编辑模式下
+                # 「删除当前筛选的全部 N 条」。算一次两处共用——
+                # count_by_filter 是有代价的（最多数 COUNT_CAP 行），
+                # 同一个数字不值得数两遍
+                has_filter = bool(src or kind or res or alive or min_bytes)
+                n_match, capped = (
+                    count_by_filter(conn, q, min_bytes, src, alive, kind, res)
+                    if ALLOW_DELETE[0] or (not q and has_filter) else (0, False))
+
                 head = ""
                 if not q:
-                    head = ('<p class="browsehead">浏览全部 %s 条%s，按%s排序</p>'
-                            % (format(st["count"], ","),
-                               ("（来源 %s）" % esc(src)) if src else "",
-                               esc(dict(ORDER_LABEL).get(
-                                   sort if sort != "relevance" else "date", ""))))
+                    # 排序标签跟 do_search 共用 effective_sort：
+                    # 没有关键词时相关度退成最近出现，这行说的是真正生效的那个
+                    order = esc(dict(ORDER_LABEL).get(
+                        effective_sort(sort, q), ""))
+                    if not has_filter:
+                        head = ('<p class="browsehead">浏览全部 %s 条，按%s排序</p>'
+                                % (format(st["count"], ","), order))
+                    elif n_match:
+                        # 筛过之后就别再说「全部」了：st["count"] 是全库总数，
+                        # 页面上列着 8 条电影、这行写「浏览全部 81 条」是在说谎。
+                        # 全库总数页头的「库里 N 条」已经有了，这里带一句括号够了
+                        head = ('<p class="browsehead">当前筛选下 %s 条%s，'
+                                '按%s排序（库里共 %s 条）</p>'
+                                % (format(n_match, ","), "以上" if capped else "",
+                                   order, format(st["count"], ",")))
+                    else:
+                        # count_by_filter 撞上 deadline 会返回 0。明明列着结果
+                        # 却写「0 条」比不给数字更糟，这种时候就不给数字
+                        head = ('<p class="browsehead">当前筛选下的结果，按%s排序</p>'
+                                % order)
                 elif Index.needs_like(q) and st["count"] > LIKE_WINDOW:
                     # 单字搜索走的是没有索引的逐行比对，只能在最近入库的一段里找。
                     # 不说这句话，用户会以为这就是全库的结果
@@ -1859,41 +2322,89 @@ class Handler(BaseHTTPRequestHandler):
                             '只在最近入库的 %s 条里找。多打一个字就能搜全库。</p>'
                             % format(LIKE_WINDOW, ","))
                 editable = ALLOW_DELETE[0]
-                n_match, capped = (count_by_filter(conn, q, min_bytes, src)
-                                   if ALLOW_DELETE[0] else (0, False))
                 body = head + render_results(
                     rows, q, page_no, has_next, sort, minsz, src,
                     total_matching=n_match, count_capped=capped,
-                    can_delete=ALLOW_DELETE[0])
+                    can_delete=ALLOW_DELETE[0], alive=alive, show_peers=show_peers,
+                    kind=kind, res=res, show_parse=show_parse)
             elif q:
                 body = NO_MATCH % (esc(q), format(st["count"], ","))
             else:
-                body = ('<div class="empty"><p>这个筛选条件下没有条目。'
-                        '<a href="/?q=">看全部</a></p></div>')
+                if alive:
+                    hint = ("这个筛选条件下没有实测到还有人做种的条目。"
+                            "库里大部分条目可能根本没测过——"
+                            "去<a href=\"/tasks\">任务面板</a>跑一次「实测做种情况」。")
+                elif (kind or res) and not_parsed(conn):
+                    # 列补上了但还没回填，筛出来必然是零条。
+                    # 不说这句的话，看着就像「库里没有剧集」
+                    hint = ("这个筛选条件下没有条目——不过库里还有条目没解析过名字，"
+                            "分类和清晰度是空的，筛不出来。"
+                            "去<a href=\"/tasks\">任务面板</a>点一次「解析名字」。")
+                else:
+                    hint = "这个筛选条件下没有条目。"
+                body = ('<div class="empty"><p>%s '
+                        '<a href="/?q=">看全部</a></p></div>' % hint)
 
         title = ("%s — 本地搜索" % q) if q else "本地搜索"
-        self.reply(page(title, body, q, sort, minsz, st,
-                        sources=list_sources(conn), src=src, editable=editable))
+        self.reply(page(title, body, editable=editable, **common))
 
-    def page_detail(self, infohash):
+    def page_detail(self, infohash, one):
+        """
+        详情页的页头和搜索页必须长得一模一样。
+
+        以前这里只给了标题、正文和统计，别的一概没传，于是页头上的筛选控件
+        全是空壳：来源下拉只剩「全部来源」，分类和清晰度干脆不出现
+        （它们要 show_parse 才渲染），搜索框里的词也没了。点进一条详情
+        再想接着筛，得先退回去——而退回去的按钮长得跟能用似的。
+
+        现在把当前的筛选原样带过来：结果行上的链接里就挂着这些参数，
+        所以从哪一屏点进来的，页头就还是那一屏的样子，
+        搜索框一提交就回到那次筛选，还能给一个「回到结果」的链接。
+        """
         conn = conn_for(self.db_path)
+        (q, sort, minsz, _min_bytes, page_no, src, alive, kind,
+         res), common = self.header_state(conn, one)
         r = get_one(conn, infohash)
         if not r:
             return self.reply(page("找不到", '<div class="empty"><p>库里没有这个种子。'
-                                   '<a href="/">回到搜索</a></p></div>'), code=404)
-        self.reply(page(r["name"], render_detail(r), stats=get_stats(conn, self.db_path)))
+                                   '<a href="/">回到搜索</a></p></div>', **common),
+                              code=404)
+        # 「回到结果」放页头的动作区，跟「浏览全部」并排——它们是同一类东西。
+        # 放页头还有个实际好处：页头是吸顶的，文件列表拉到多深都够得着
+        back = ""
+        if q or src or kind or res or alive or minsz or page_no > 1:
+            back = qs(q=q, sort=sort, min=minsz, src=src, kind=kind,
+                      res=res, alive="1" if alive else "", page=page_no)
+        self.reply(page(r["name"], render_detail(r), back=back, **common))
 
     def api_search(self, one):
-        q, sort, minsz, min_bytes, page_no, src = self._params(one)
+        q, sort, minsz, min_bytes, page_no, src, alive, kind, res = self._params(one)
         try:
             limit = max(1, min(int(one("limit", str(PER_PAGE))), MAX_LIMIT))
         except ValueError:
             limit = PER_PAGE
         conn = conn_for(self.db_path)
+        show_peers = has_peers(conn)
+        alive = alive and show_peers
+        if sort == PEERS_SORT and not show_peers:
+            sort = "relevance"
+        if not has_parse(conn):
+            kind = res = ""
         rows, has_next = do_search(conn, q, page_no, sort, min_bytes,
-                                   per_page=limit, source=src)
+                                   per_page=limit, source=src, alive=alive,
+                                   kind=kind, res=res)
         out = [{"infohash": r["infohash"], "name": r["name"], "size": r["size"],
                 "nfiles": r["nfiles"], "hits": r["hits"], "last_seen": r["last_seen"],
+                # -1 是「没测过」，原样交出去让调用方自己判断，
+                # 别在这里替它折成 0——那就把「不知道」说成了「没人」
+                "peers": r.get("peers", -1), "checked_at": r.get("checked_at", 0),
+                # kind / res 是库里存的那两列，筛选用的就是它们。
+                # parsed 里只放不进库、每次现算的那几样——两处都叫 kind
+                # 而值可能不同（规则改过还没回填），对调用方是个陷阱，
+                # 所以这里把重复的两个键去掉，一个字段只有一个出处
+                "kind": r.get("kind", ""), "res": r.get("res", ""),
+                "parsed": {k: v for k, v in parse_name(r["name"], "").items()
+                           if k not in ("kind", "res")},
                 "magnet": magnet(r["infohash"], r["name"])} for r in rows]
         self.reply(json.dumps({"query": q, "page": page_no, "has_next": has_next,
                                "results": out}, ensure_ascii=False, indent=2),

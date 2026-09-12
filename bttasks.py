@@ -112,6 +112,9 @@ def build_argv(kind, params, db):
                          str(_clamp(params.get("limit"), 1, 5000, 200))], "实测做种情况"),
             "enrich":  (["btenrich.py", "--db", db, "--limit",
                          str(_clamp(params.get("limit"), 1, 5000, 200))], "补全文件列表"),
+            # 解析不联网也不删东西，所以不设 limit：一次跑完省得人点好几遍。
+            # 一百万条大约两分钟，中途停掉也没事，下次接着上次的来
+            "parse":   (["btparse.py", "backfill", "--db", db], "解析名字"),
         }
         if action not in table:
             raise ValueError("不认识的维护动作：%r" % action)

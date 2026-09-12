@@ -40,6 +40,12 @@ import sys
 import time
 import urllib.parse
 
+# 名字解析。导入方向只有这一个：btindex -> btparse。
+# btparse 不许反过来导入 btindex，否则就是循环导入——
+# 它需要的补列函数因此只能自己带一份，见那边 ensure_columns 的说明。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from btparse import PARSE_VERSION, ensure_parse_columns, fields as parse_fields
+
 DB_DEFAULT = "bt.db"
 MAX_FILELIST = 40                  # 每个种子最多索引多少个文件名，防止巨型种子撑爆索引
 LIKE_WINDOW = 500000               # 单字查询退回 LIKE 时默认只扫最近这么多条
@@ -60,7 +66,18 @@ CREATE TABLE IF NOT EXISTS torrents (
     source     TEXT    NOT NULL DEFAULT '',
     first_seen INTEGER NOT NULL,
     last_seen  INTEGER NOT NULL,
-    hits       INTEGER NOT NULL DEFAULT 1
+    hits       INTEGER NOT NULL DEFAULT 1,
+    -- 实测的做种/下载人数，btpeers 写回。-1 表示从来没测过，
+    -- 0 表示测过但当时一个人都没有（死种）。两者含义完全不同，
+    -- 不能合并成 0——「没人要」和「还不知道」在搜索结果里得分开显示。
+    peers      INTEGER NOT NULL DEFAULT -1,
+    checked_at INTEGER NOT NULL DEFAULT 0,
+    -- 从名字里解析出来的分类和清晰度，规则在 btparse.py。
+    -- 空串表示认不出来，不表示没解析过——那个看 parsed：
+    -- 它存的是解析这条时用的规则版本号，0 是从来没解析过。
+    kind       TEXT    NOT NULL DEFAULT '',
+    res        TEXT    NOT NULL DEFAULT '',
+    parsed     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_last_seen ON torrents(last_seen);
 CREATE INDEX IF NOT EXISTS idx_size      ON torrents(size);
@@ -69,9 +86,17 @@ CREATE INDEX IF NOT EXISTS idx_hits      ON torrents(hits);
 -- 600 万条上 2.7 秒；有了它走覆盖索引，同样的查询 0.26 秒。
 -- source 只有几种取值，索引本身很小，白捡的十倍。
 CREATE INDEX IF NOT EXISTS idx_source    ON torrents(source);
+-- peers / checked_at / kind / res / parsed 的索引都不在这儿，在 ensure_columns 里建。
+-- 因为 SCHEMA 跑在补列之前：老库那会儿还没有这两列，
+-- 在这里写 CREATE INDEX ON torrents(peers) 会直接 no such column，
+-- 把每一次打开库都炸掉——而且只炸老库，新库一点事没有，最难发现的那种。
 
 CREATE VIRTUAL TABLE IF NOT EXISTS torrents_fts USING fts5(
-    body,
+    -- 两列而不是一列：名字（含中文二元组）和文件列表（含二元组）分开存。
+    -- 分开是为了能给它们不同的权重——见下面 BM25_ORDER 的说明。
+    -- 老库是单列的 body，照样能用，写入时会认出来；迁过来靠 btmigrate.py。
+    name,
+    files,
     tokenize='unicode61',
     -- content='' 是无正文模式：只建倒排索引，不再把 body 原样存一份。
     -- 原因很直接——那份副本从来没人读。全文里所有 FTS 访问不是 MATCH、
@@ -154,6 +179,55 @@ def build_match(query: str, prefix: bool = True) -> str:
                         for t, star in terms)
 
 
+# 名字的权重是文件列表的十倍。
+#
+# 为什么需要这个：一列的时候，「名字里就叫这个」和「文件列表里碰巧提了一嘴」
+# 在 bm25 眼里没有区别，而且长度惩罚还会帮倒忙——搜 matrix，一条
+# 「Dev Tools Pack 3 / bin/matrix.dll」比「The Matrix 1999 1080p BluRay x264」
+# 整体更短，于是前者排在前面。实测过：一列时前十名全是文件列表命中的，
+# 拆成两列加权之后前十名全是名字命中的。
+#
+# 为什么是 10：实测权重到 2 就已经翻过来了，而 2 到 30 之间前十名的构成完全一样，
+# 所以这个数不敏感，取个稳妥的整数。也试过会不会把「合集」类资源埋掉——
+# 不会，它们本来就因为文件列表长被长度惩罚压在最后。
+#
+# 这个表达式对**单列的老库也安全**：多给的权重会被忽略，剩下那个权重
+# 对所有行是同一个倍数，排序不变。实测确认过前十名和 bm25(torrents_fts) 一致。
+# 所以读这一侧不用分两套代码，只有写入要认表结构。
+NAME_WEIGHT = 10.0
+FILES_WEIGHT = 1.0
+BM25 = "bm25(torrents_fts, %s, %s)" % (NAME_WEIGHT, FILES_WEIGHT)
+
+
+def fts_two_col(conn, table="torrents_fts") -> bool:
+    """这个库的全文索引是不是两列的。老库是单列 body。"""
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+    except sqlite3.Error:
+        return False
+    return "name" in cols and "files" in cols
+
+
+def fts_write(conn, rowid, name, filelist, two_col=None):
+    """
+    往 FTS 表里写一行。两种表结构都认，这是唯一知道该写几列的地方——
+    btindex.upsert 和 btprune 的修复都走这儿，免得两边各写一份再漂掉。
+
+    索引正文 = 原文 + 中文二元组展开，名字和文件列表各一份。
+    单列的老库把两份拼起来写进 body，和拆分之前完全一样。
+    """
+    if two_col is None:
+        two_col = fts_two_col(conn)
+    name_body = "%s %s" % (name, expand_text(name))
+    files_body = "%s %s" % (filelist, expand_text(filelist))
+    if two_col:
+        conn.execute("INSERT INTO torrents_fts(rowid, name, files) VALUES (?,?,?)",
+                     (rowid, name_body, files_body))
+    else:
+        conn.execute("INSERT INTO torrents_fts(rowid, body) VALUES (?,?)",
+                     (rowid, "%s %s" % (name_body, files_body)))
+
+
 def human(n) -> str:
     n = int(n or 0)
     if n <= 0:
@@ -194,6 +268,40 @@ def magnet(infohash: str, name: str = "") -> str:
 # 索引本体
 # --------------------------------------------------------------------------
 
+def ensure_columns(conn):
+    """
+    幂等地把 peers / checked_at 补到老库上。
+
+    新库由 SCHEMA 带出来，不用管。但 `CREATE TABLE IF NOT EXISTS` 对已经存在的表
+    什么也不做——它不会去比对列——所以 2026-09 之前建的库不跑这一趟就永远缺这两列。
+
+    放在这里而不是 btpeers 里，是因为网页是**只读**打开的，加不了列。
+    只要跑过一次爬虫、导入或维护（都要写，都会走 Index.__init__），列就补上了。
+    这和 idx_source 是同一个故事。
+
+    返回这次真加了哪几列，调用方想说一句就说，不想说就扔掉。
+    """
+    have = {r[1] for r in conn.execute("PRAGMA table_info(torrents)")}
+    added = []
+    if "peers" not in have:
+        conn.execute("ALTER TABLE torrents ADD COLUMN peers INTEGER NOT NULL DEFAULT -1")
+        added.append("peers")
+    if "checked_at" not in have:
+        conn.execute("ALTER TABLE torrents ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0")
+        added.append("checked_at")
+    # 无条件建，不是「加了列才建」。新库的列由 SCHEMA 带出来，走不到上面那两个
+    # 分支，但索引同样需要；IF NOT EXISTS 让重复调用不花钱。
+    # 「只看还有人做种的」和「按做种数排序」都靠 idx_peers。绝大多数行是 -1，
+    # 索引偏得厉害，但要的正是偏出来那一小撮。
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_peers   ON torrents(peers)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_checked ON torrents(checked_at)")
+    # kind / res / parsed 三列连同它们的索引交给 btparse——那三列的定义只有一处，
+    # 这里只是把它串进同一趟补列里，好让任何一个写库的工具开一次库就全补齐。
+    added += ensure_parse_columns(conn)
+    conn.commit()
+    return added
+
+
 def require_sqlite():
     """
     建库之前先拦一道。SCHEMA 里的 content='' + contentless_delete=1 是
@@ -224,6 +332,10 @@ class Index:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+        ensure_columns(self.db)          # 老库补列，新库这一步什么也不做
+        # 全文索引是两列还是老的单列，开库时探一次记住。
+        # 表结构在一个连接的生命周期里不会变——要变得走 btmigrate，那要独占写
+        self.fts2 = fts_two_col(self.db)
         self.db.commit()
 
     # ---------- 写 ----------
@@ -251,27 +363,30 @@ class Index:
 
         row = self.db.execute(
             "SELECT rowid FROM torrents WHERE infohash=?", (infohash,)).fetchone()
-        # 索引正文 = 原名 + 中文展开 + 文件名 + 文件名展开，四份都能搜
-        body = "%s %s %s %s" % (name, expand_text(name), filelist, expand_text(filelist))
+        # 写的时候顺手解析，这样只有老条目需要回填，新进来的一律是解析好的。
+        # 实测一条一两个微秒，相比爬虫那边一条种子几百毫秒的网络等待可以忽略。
+        kind, res = parse_fields(name, filelist)
 
         if row:
             self.db.execute(
                 "UPDATE torrents SET name=?, size=?, nfiles=?, filelist=?, "
-                "source=?, last_seen=?, hits=hits+1 WHERE infohash=?",
-                (name, size, nfiles, filelist, source, now, infohash))
+                "source=?, last_seen=?, hits=hits+1, kind=?, res=?, parsed=? "
+                "WHERE infohash=?",
+                (name, size, nfiles, filelist, source, now,
+                 kind, res, PARSE_VERSION, infohash))
             # FTS 表手动跟着改。所有写操作都走这个函数，所以不用触发器也能保持一致；
             # 真要多入口写库，就得换成 AFTER INSERT/UPDATE/DELETE 触发器。
             self.db.execute("DELETE FROM torrents_fts WHERE rowid=?", (row["rowid"],))
-            self.db.execute("INSERT INTO torrents_fts(rowid, body) VALUES (?,?)",
-                            (row["rowid"], body))
+            fts_write(self.db, row["rowid"], name, filelist, self.fts2)
             return False
 
         cur = self.db.execute(
             "INSERT INTO torrents(infohash,name,size,nfiles,filelist,source,"
-            "first_seen,last_seen,hits) VALUES (?,?,?,?,?,?,?,?,1)",
-            (infohash, name, size, nfiles, filelist, source, now, now))
-        self.db.execute("INSERT INTO torrents_fts(rowid, body) VALUES (?,?)",
-                        (cur.lastrowid, body))
+            "first_seen,last_seen,hits,kind,res,parsed) "
+            "VALUES (?,?,?,?,?,?,?,?,1,?,?,?)",
+            (infohash, name, size, nfiles, filelist, source, now, now,
+             kind, res, PARSE_VERSION))
+        fts_write(self.db, cur.lastrowid, name, filelist, self.fts2)
         return True
 
     def commit(self):
@@ -361,11 +476,11 @@ class Index:
             params.append(max_size)
 
         order = {
-            "relevance": "bm25(torrents_fts), t.hits DESC",
-            "hits":      "t.hits DESC, bm25(torrents_fts)",
+            "relevance": "%s, t.hits DESC" % BM25,
+            "hits":      "t.hits DESC, %s" % BM25,
             "size":      "t.size DESC",
             "date":      "t.last_seen DESC",
-        }.get(sort, "bm25(torrents_fts), t.hits DESC")
+        }.get(sort, "%s, t.hits DESC" % BM25)
 
         sql = ("SELECT t.* FROM torrents_fts JOIN torrents t ON t.rowid = torrents_fts.rowid "
                "WHERE %s ORDER BY %s LIMIT ?" % (" AND ".join(where), order))

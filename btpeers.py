@@ -387,24 +387,10 @@ def estimate_seeders(peers, infohash, sample=20, workers=10, timeout=6):
 # 索引里加两列，用来存查询结果
 # --------------------------------------------------------------------------
 
-def ensure_columns(conn):
-    """
-    幂等地补上 peers 和 checked_at 两列。
-    加列是向后兼容的：btindex 的 upsert 用的是具名列，多两列不影响它，
-    web 那边 dict(row) 也只是多两个键。
-    """
-    have = {r[1] for r in conn.execute("PRAGMA table_info(torrents)")}
-    added = []
-    if "peers" not in have:
-        conn.execute("ALTER TABLE torrents ADD COLUMN peers INTEGER NOT NULL DEFAULT -1")
-        added.append("peers")
-    if "checked_at" not in have:
-        conn.execute("ALTER TABLE torrents ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0")
-        added.append("checked_at")
-    if added:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_checked ON torrents(checked_at)")
-        conn.commit()
-    return added
+# 这两列的定义现在只有一处：btindex.ensure_columns，SCHEMA 里也带着同样的默认值。
+# 以前这里自己写了一份一模一样的 ALTER，两边迟早会漂——比如这边补了索引、
+# 那边没补。留这个别名是为了本文件里的调用点不用改。
+from btindex import ensure_columns          # noqa: E402  （放这儿是为了紧挨着说明）
 
 
 # --------------------------------------------------------------------------
