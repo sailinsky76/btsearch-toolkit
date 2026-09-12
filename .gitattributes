@@ -1,0 +1,11 @@
+# .bat 必须是 CRLF。Linux 上克隆时 git 可能按本地习惯换成 LF，
+# 那样在 Windows 的 cmd 里跑会出各种莫名其妙的问题（尤其是标签和 goto）。
+*.bat text eol=crlf
+
+# 其余一律 LF
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+
+# 别把这些算进语言统计
+*.bat linguist-language=Batchfile

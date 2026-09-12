@@ -1,0 +1,37 @@
+# 索引数据库 —— 绝对不能提交。里面是爬来的第三方内容元数据，
+# 提交了等于把一份索引直接发布出去，性质和只发布代码完全不同。
+bt.db
+bt.db-wal
+bt.db-shm
+*.db
+*.db-wal
+*.db-shm
+*.maintlock
+
+# 运行产物
+logs/
+backup/
+hashes.txt
+names.tsv
+*.torrent
+test-torrents/
+
+# 导出文件。README 里明写了 `list -n 99999 --magnet > all.txt`，
+# 那个文件装的是整份索引导出的全部磁力链——提交上去和发布一份索引没区别，
+# 正是上面那条不提交 bt.db 的理由。
+all.txt
+all.tsv
+*.tsv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
