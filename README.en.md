@@ -58,7 +58,7 @@ python dhtmeta.py --sniff --db bt.db --with-lookup  # start crawling the DHT
 
 Or skip the command line entirely: start `btweb.py` and open
 **http://127.0.0.1:8080/tasks** — the crawler, all four import sources, and maintenance actions
-each have a form and a live log there. On Windows that is double-click `web.bat`, then click.
+each have a form and a live log there. On Windows that is double-click `web-admin.bat`, then click.
 
 Letting a web page spawn processes is a meaningful privilege escalation, so the command line is
 **assembled from a fixed template**, never concatenated: the endpoint accepts a task kind plus
@@ -66,6 +66,12 @@ named parameters, integers are clamped to sane ranges, paths and URLs are passed
 argv elements, and nothing goes through a shell. Same CSRF token and same-origin checks as the
 delete endpoint. Pass `--no-tasks --no-delete` if you ever bind to anything other than
 `127.0.0.1`.
+
+Two launchers ship with those two configurations already set: `web-admin.bat` (port 8080, task
+panel and list editing on) and `web-user.bat` (port 8081, search only — the task button and the
+edit-list button are not rendered, and `/api/task`, `/api/browse` and `/api/delete` all answer
+403). The ports differ so both can run side by side. These replace the old `web.bat`, which is
+gone — update any shortcut that still points at it.
 
 `btcheck.py` verifies more than the environment: it statically scans every script for undefined
 names, checks that the inline browser JavaScript has no unterminated string literals, verifies
@@ -370,6 +376,19 @@ button of the same size and style, and the name now lives only in the tab title 
 readers. Header height: 238px to 176px. That nav button does one thing — go to the task panel. It
 is not a toggle that renames itself per page: getting back to the list is what the search button
 already does, from anywhere. Same reasoning as the deleted "browse all" link.
+
+**When a feature is off, its entry point goes too.** That nav button used to render
+unconditionally even though `/api/task` had been answering 403 under `--no-tasks` all along — a
+button in the most prominent spot on the page whose only effect was an error. It is now gated on
+the same flag, and so are the "go click this in the task panel" hints in the body copy (empty-index
+page, landing page, the detail page's "not measured yet" and "no file list", and the two
+zero-result hints). The half that explains *why* you are seeing nothing stays in both builds; the
+half that points at a button is admin-only, because in the user build that button does not exist.
+
+Removing it right-aligns the submit button for free, with no CSS change: the search input is
+`flex:1 1 280px`, so it absorbs every spare pixel on that row and whatever comes last is flush
+against the end. `margin-left:auto` would be a no-op here — there is no free space left for an
+auto margin to claim.
 
 A related trap: the global `a:hover{text-decoration:underline}` has specificity (0,1,1) and beats
 `text-decoration:none` declared on `.go` (0,1,0). **When a button is an anchor, repeat

@@ -90,6 +90,33 @@ def _parse_case_count(here):
         return 0
 
 
+def _query_case_count(here):
+    """同上，只为了显示个数。"""
+    sys.path.insert(0, here)
+    try:
+        import btindex
+        return len(btindex.QUERY_CASES) + len(btindex.EXPAND_CASES)
+    except Exception:
+        return 0
+
+
+def check_query_rules(here):
+    """
+    分词和查询构造的用例。
+
+    入库展开和查询展开是同一套规则的两头，错开一点就是「库里明明有、怎么都
+    搜不出来」——而且不报任何错，只是结果少了。这一项和「名字解析规则」是一对：
+    那边守的是「这条是什么」，这边守的是「这个词能不能搜到」。
+    """
+    sys.path.insert(0, here)
+    try:
+        import btindex
+    except ImportError as e:
+        return ["btindex 导不进来：%s" % e]
+    return ["%s(%r)：期望 %r，实际 %r" % (where, src[:30], want, got)
+            for where, src, want, got in btindex.selftest()]
+
+
 def _visible_names(tree):
     names = set()
     for n in ast.walk(tree):
@@ -401,6 +428,9 @@ def main():
     guard("名字解析规则", lambda: check_parse_rules(here),
           "%d 条用例全过" % _parse_case_count(here))
 
+    guard("分词与查询构造", lambda: check_query_rules(here),
+          "%d 条用例全过" % _query_case_count(here))
+
     guard("命令行选项位置", lambda: check_cli_flags(here),
           "选项写在子命令前后都接受")
 
@@ -429,7 +459,7 @@ def main():
     if IS_WINDOWS:
         print("  1. 右键 install-firewall.bat 用管理员身份运行（放行 UDP 入站）")
         print("  2. 双击 crawler.bat 开始爬，让它跑几个小时")
-        print("  3. 双击 web.bat 搜索")
+        print("  3. 双击 web-admin.bat 搜索（只给别人搜的话用 web-user.bat）")
     else:
         print("  %s dhtmeta.py --sniff --db bt.db --with-lookup" % py_cmd())
         print("  %s btweb.py --db bt.db" % py_cmd())

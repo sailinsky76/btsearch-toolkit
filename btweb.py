@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from btcompat import BUILD, db_uri, py_cmd, setup_console
 from btindex import (BM25, DB_DEFAULT, Index, build_match, human, magnet,
-                     parse_size)
+                     parse_size, split_query)
 from btparse import (CODEC_TEXT, KIND_LABEL, KIND_TEXT, MEDIUM_TEXT,
                      PARSE_VERSION, RES_LABEL, describe, parse as parse_name,
                      se_text)
@@ -321,6 +321,47 @@ def do_search(conn, query, page=1, sort="relevance", min_size=0, per_page=PER_PA
     return rows[:per_page], len(rows) > per_page
 
 
+def fold_dupes(rows):
+    """
+    把同一份内容的重复发布折成一条。返回 (折后的行, 折掉了几条)。
+
+    **判据是 名字 + 体积 + 文件数 三样全等**，不做任何名字解析。一个种子被不同的人
+    重新做一遍（换 tracker 列表、换分片大小），infohash 会变、这三样不会变；而
+    infohash 是主键，同一个种子本来就进不来两次，所以库里剩下的重复恰好就是这一类。
+
+    为什么不按解析出来的片名折：那要先归一化标题，而归一化一定会认错，认错的方向
+    是**把两部不同的片并成一条**——用户看不到被藏起来的那条，也不知道自己少看了什么。
+    假分裂只是跟现在一样，假合并是在骗人，两种错的代价不对称，所以键要保守到
+    宁可少折。这个键近乎是证明：同名、同一个字节数、同一个文件数还不是同一份东西，
+    实际上碰不到。
+
+    体积必须进键。光按名字折是不安全的——同名不同体积就是不同内容
+    （重压过的、带不带花絮的），把它们并成一条正是上面说的那种假合并。
+
+    代表条目取**当前排序下排在最前面的那个**，不是做种人数最多的那个。排序已经按用户
+    选的标准挑过一遍了，再换一个标准挑代表，结果就是显示出来的那行和它所在的位置
+    对不上——按时间排的列表里，某一行的时间比它上面那行还旧，看着像排序坏了。
+    组里各条内容完全相同，谁当代表都能下到同样的东西，不值得为此让排序自相矛盾。
+
+    只在**本页取到的这批行**里折，不跨页。相关度排序下同名同体积的条目 bm25 得分相同、
+    必然相邻，所以这个限制几乎不起作用；按时间排时偶尔会有一组被页边界切开，
+    代价是那一条在两页上各出现一次，比重做分页那套账便宜得多。
+    """
+    seen, out, folded = {}, [], 0
+    for r in rows:
+        key = (r["name"], r["size"], r["nfiles"])
+        head = seen.get(key)
+        if head is None:
+            r = dict(r)
+            r["dupes"] = []          # 同组其余条目的 infohash，删除时要用
+            seen[key] = r
+            out.append(r)
+        else:
+            head["dupes"].append(r["infohash"])
+            folded += 1
+    return out, folded
+
+
 def get_one(conn, infohash):
     if not HEX40.match(infohash or ""):
         return None
@@ -334,9 +375,16 @@ CSRF = [os.urandom(16).hex()]      # 每次启动随机生成，跨站页面拿�
 ALLOW_DELETE = [True]
 # 上一次真正看过的那份列表（形如 "?q=&sort=size"）。空手回到 / 时拿它把人送回原处：
 # 从列表切去任务面板再点站名回来，不该落到一张空提示卡上。
-# 只在内存里，重启就清空，所以 web.bat 每次开起来仍然是落地页。
+# 只在内存里，重启就清空，所以网页每次开起来仍然是落地页。
 # 存的是重新拼过的参数串而不是原始查询串，写进 Location 头才不会夹带东西。
 LAST_VIEW = [""]
+# 上面那个变量是全进程一份，这个工具没有会话概念。只监听本机时这正好对：
+# 机器前面只有一个人，「上次看的那屏」指的就是他自己。
+#
+# 一旦监听到 0.0.0.0，同一个变量就成了所有人共用的：甲搜完一个词，乙打开首页
+# 会被 302 到甲的查询串上——等于把别人搜过什么直接摆在他面前，而且是在
+# 地址栏里。所以这个便利只在单人场景下开，对外开放时整条路直接关掉。
+SINGLE_USER = [True]
 
 
 def delete_by_hashes(path, hashes):
@@ -485,14 +533,58 @@ def _facet_raw(conn, col):
         return {}
 
 
-def facet_counts(conn, col):
+def _facet_filtered(conn, col, query, min_size, source, alive, kind, res):
+    """
+    当前筛选下某一列的分布。算不出来（超时或超过上限）时返回 None。
+
+    返回 None 和返回 {} 是两件事，不能混：{} 是「每一档都是零条」，
+    会被 opts_n 理解成「所有选项都该藏起来」，于是下拉里只剩当前选中的那个，
+    看着像筛选把自己吃掉了。None 是「这个数算不出来」，此时下拉照列，只是不带数字。
+    """
+    where, params = filter_clauses(min_size, source, alive, kind, res, p="")
+    match = build_match(query) if query else ""
+    if match:
+        where.insert(0, "rowid IN (SELECT rowid FROM torrents_fts "
+                        "WHERE torrents_fts MATCH ?)")
+        params.insert(0, match)
+    cond = (" WHERE " + " AND ".join(where)) if where else ""
+    # 和 count_by_filter 同一个道理：为了下拉里那几个数字去扫穿整张表不划算。
+    # 扫到上限就停。但这里比那边严一格——那边到顶显示「50,000+」，模糊但不算错；
+    # 这里到顶意味着各档的比例都是偏的，偏的数字比没有数字更坏，所以直接不给。
+    sql = ("SELECT %s, count(*) FROM (SELECT %s FROM torrents%s LIMIT %d) "
+           "GROUP BY 1" % (col, col, cond, COUNT_CAP + 1))
+    with _Deadline(conn):
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.Error:
+            return None
+    out = {(r[0] or ""): r[1] for r in rows}
+    return None if sum(out.values()) > COUNT_CAP else out
+
+
+def facet_counts(conn, col, query="", min_size=0, source="", alive=False,
+                 kind="", res=""):
     """
     分类 / 清晰度下拉旁边那个条数。
 
-    和来源下拉同一套：小库实算，大库走 stale-while-revalidate 缓存。
-    数的是**全库**而不是当前筛选下的条数——后者每换一个筛选都要重数一遍，
-    而这个数字的用处是「库里有多少剧集」，不是「在当前筛选里有多少」。
+    **跟着当前的其他筛选条件走**，因为这个数字就贴在筛选项旁边，人会把它读成
+    「点下去能拿到多少条」。筛成某个来源之后还写着全库的「剧集 12,000」，
+    点进去只有 30 条——那个数就是在骗人。原先为了省开销数的是全库，
+    省下的那点时间不值得拿一个错数字去换。
+
+    不含**自己这一维**：算分类的分布时不带 kind 条件。带上的话，选了「电影」
+    以后别的分类全是零条、被 opts_n 藏光，就再也切不回「剧集」了。
+
+    开销上分两条路。一条筛选都没有时走原来那套缓存（大库 stale-while-revalidate、
+    小库实算），这是开着页面最常落到的情形，性能一点没变；一旦带上筛选就实算，
+    封顶加超时守着，算不出来就返回 None，让下拉退回「只有选项、没有数字」。
     """
+    if query or min_size or source or alive or kind or res:
+        if conn is None:
+            return with_own_conn(lambda c: _facet_filtered(
+                c, col, query, min_size, source, alive, kind, res))
+        return _facet_filtered(conn, col, query, min_size, source, alive, kind, res)
+
     known = (_CACHE.get("stats") or [None])[0]
     if (known or {}).get("count", 0) > STATS_CACHE_FROM:
         return cached("facet_" + col, STATS_TTL,
@@ -1082,6 +1174,17 @@ body.selmode .tools{display:flex}
 .tools .all{color:var(--muted);display:flex;gap:7px;align-items:center;cursor:pointer}
 #delmsg{color:var(--muted);font-size:12px}
 .browsehead{color:var(--faint);font-size:11.5px;margin:14px 0 0}
+/* 跨页选中的计数。「不在本页」那几个字要跳出来，它是这里唯一的风险提示 */
+.selnote{color:var(--faint);font-size:12px}
+.selnote b{color:var(--danger)}
+.selnote a{margin-left:8px}
+
+/* 折起的重复发布。用边框而不是底色：这一行里已经有做种状态在用颜色了，
+   再加一块色就分不清哪个是状态、哪个是计数 */
+.dupe{
+  border:1px solid var(--line); border-radius:3px;
+  padding:0 5px; color:var(--muted);
+}
 /* 详情页顶上那个「回到结果」。只在带着筛选点进来时才出现 */
 a.backlink{font-size:12.5px}
 .pager{display:flex;gap:18px;padding:22px 0 44px;font-size:13.5px}
@@ -1296,26 +1399,120 @@ document.addEventListener('click', function(e){
                           return m ? m.content : ''; };
   var picks = function(){ return Array.prototype.slice.call(
                             document.querySelectorAll('.pick')); };
-  var chosen = function(){ return picks().filter(function(c){ return c.checked; }); };
+
+  // ── 选中集 ──
+  // 原先「选中」就是勾选框自己的 checked，翻一页整份就没了，没法隔页攒着删。
+  // 现在真身是这个集合，勾选框只是它在当前这一页上的视图。
+  //
+  // 存 sessionStorage 不是 localStorage：关掉标签页就清干净。删除不可撤销，
+  // 一份昨天的选中活到今天再被人顺手点掉，是这里最不该发生的事。
+  //
+  // 存的是单个 infohash 不是勾选框的 value。value 在折叠状态下是一串逗号
+  // 分隔的组，展开之后同样几条会变成各自独立的行——按 value 存的话，
+  // 折起来选的东西展开后一个都对不上，可删除时又照样会删掉，自相矛盾。
+  var SEL_KEY = 'btsearch.sel';
+  var MAX_SEL = 2000;          // 服务端 5000 上限，这里留足余量并早点说话
+  function selLoad(){
+    try { return JSON.parse(sessionStorage.getItem(SEL_KEY) || '[]') || []; }
+    catch (e) { return []; }   // 存储被禁或内容坏了就当没选，不要让页面挂掉
+  }
+  function selSave(list){
+    try { sessionStorage.setItem(SEL_KEY, JSON.stringify(list)); } catch (e) {}
+  }
+  var sel = selLoad();
+  var selHas = function(h){ return sel.indexOf(h) >= 0; };
+  function selAdd(hs){
+    hs.forEach(function(h){ if (h && !selHas(h)) sel.push(h); });
+    selSave(sel);
+  }
+  function selDrop(hs){
+    sel = sel.filter(function(h){ return hs.indexOf(h) < 0; });
+    selSave(sel);
+  }
+  function selClear(){ sel = []; selSave(sel); }
+
+  var hashesOf = function(c){ return c.value.split(','); };
+  // 一个勾选框是不是「已选」：它代表的条目得全在集合里。
+  // 折叠行代表好几条，少一条就不算全选中，半选状态不撒谎
+  var isPicked = function(c){
+    return hashesOf(c).every(selHas);
+  };
   var msg = document.getElementById('delmsg');
   var delsel = document.getElementById('delsel');
   var delall = document.getElementById('delall');
   var pickall = document.getElementById('pickall');
+  var selnote = document.getElementById('selnote');
   if (!delsel) return;
 
+  // 不在编辑状态就把选中集清掉。
+  //
+  // 改查询词或换筛选条件之后点搜索，表单里没有 edit 字段，页面必然回到浏览状态——
+  // 这时还留着一份上一轮的选中，它既不显示也点不到，下次进编辑却会凭空冒出来。
+  // 编辑状态和选中集同生共死，规则才说得清。
+  //
+  // 这句放在上面那个 return 后面是有意的：详情页和任务面板没有 delsel，
+  // 走不到这里。点开一条看看再回来，选的东西还在——那本来就是一次往返，
+  // 不是「重新搜了一轮」。
+  if (!document.body.classList.contains('selmode')) selClear();
+
+  // 本页上能看见的 infohash，用来算「有多少条选中的不在眼前」
+  function onPage(){
+    var a = [];
+    picks().forEach(function(c){ a = a.concat(hashesOf(c)); });
+    return a;
+  }
+
   function refresh(){
-    var n = chosen().length;
+    // 显示的是真要删掉的条目数，不是勾了几个框。勾一个框删掉三条是对的，
+    // 但按钮上写「删除选中 1 条」就是在骗人
+    var n = sel.length;
     delsel.disabled = !n;
     delsel.textContent = n ? ('删除选中 ' + n + ' 条') : '删除选中';
+    if (pickall){
+      var boxes = picks();
+      pickall.checked = boxes.length > 0 && boxes.every(isPicked);
+    }
+    if (selnote){
+      // 跨页选中最危险的地方是「选了但看不见」。数字必须一直摆在那儿，
+      // 不能等到点删除时才在确认框里第一次告诉人
+      var here = onPage();
+      var away = sel.filter(function(h){ return here.indexOf(h) < 0; }).length;
+      selnote.innerHTML = n
+        ? ('已选 ' + n + ' 条' + (away ? ('，其中 <b>' + away + ' 条不在本页</b>') : '')
+           + ' <a href="#" id="selclear">清空选择</a>')
+        : '';
+    }
   }
+
+  function syncBoxes(){        // 把集合画到当前这一页的勾选框上
+    picks().forEach(function(c){ c.checked = isPicked(c); });
+  }
+
   document.addEventListener('change', function(e){
     if (e.target === pickall){
-      picks().forEach(function(c){ c.checked = pickall.checked; });
+      picks().forEach(function(c){
+        if (pickall.checked) selAdd(hashesOf(c)); else selDrop(hashesOf(c));
+      });
+      syncBoxes();
     }
     if (e.target.classList && e.target.classList.contains('pick')) {
-      if (!e.target.checked && pickall) pickall.checked = false;
+      if (e.target.checked) selAdd(hashesOf(e.target));
+      else selDrop(hashesOf(e.target));
+      if (sel.length > MAX_SEL){
+        selDrop(hashesOf(e.target));
+        e.target.checked = false;
+        msg.textContent = '一次最多选 ' + MAX_SEL + ' 条，先删掉一批再继续。';
+      }
     }
     refresh();
+  });
+
+  document.addEventListener('click', function(e){
+    if (e.target && e.target.id === 'selclear'){
+      e.preventDefault();
+      selClear(); syncBoxes(); refresh();
+      msg.textContent = '';
+    }
   });
 
   function post(body, done){
@@ -1326,11 +1523,30 @@ document.addEventListener('click', function(e){
       .then(function(r){ return r.json(); })
       .then(function(d){
         if (d.error){ msg.textContent = '失败：' + d.error; return; }
+        selClear();          // 删掉的东西不能继续留在选中集里
         msg.textContent = '已删除 ' + d.deleted + ' 条'
                           + (d.hint ? '。' + d.hint : '，正在刷新…');
         setTimeout(function(){ location.reload(); }, d.hint ? 6000 : 600);
       })
       .catch(function(e){ msg.textContent = '请求失败：' + e; });
+  }
+
+  // 编辑状态存在 URL 里（?edit=1），翻页才带得走。页头这个按钮是就地切换的，
+  // 所以切完要把页面上那几个会跳走的链接一起改掉，否则按钮亮着、
+  // 翻过去却退出了编辑——这正是原先那个 bug。
+  // 顺带用 replaceState 改掉地址栏，刷新和「后退」也就跟着对了
+  function syncLinks(on){
+    var links = document.querySelectorAll('.pager a, .results .name a');
+    for (var i = 0; i < links.length; i++){
+      var u = new URL(links[i].getAttribute('href'), location.href);
+      if (on) u.searchParams.set('edit', '1'); else u.searchParams.delete('edit');
+      links[i].setAttribute('href', u.pathname + u.search);
+    }
+    try {
+      var here = new URL(location.href);
+      if (on) here.searchParams.set('edit', '1'); else here.searchParams.delete('edit');
+      history.replaceState(null, '', here.pathname + here.search);
+    } catch (e) {}          // file:// 之类下 replaceState 会抛，不值得为它中断
   }
 
   // 进出都是页头上这一个按钮，标签在两种状态间换。两个词都是四个字，
@@ -1342,7 +1558,11 @@ document.addEventListener('click', function(e){
       toggle.textContent = on ? '退出编辑' : '编辑列表';
       toggle.setAttribute('aria-pressed', on ? 'true' : 'false');
     }
-    if (!on){                       // 退出时清空，免得下次进来还残留上次的选中
+    syncLinks(on);
+    if (!on){
+      // 退出时清空。现在要连集合一起清——只清勾选框的话，下次进编辑
+      // 会凭空冒出「已选 12 条」，而那 12 条是上一轮留下的，人根本不记得
+      selClear();
       picks().forEach(function(c){ c.checked = false; });
       if (pickall) pickall.checked = false;
       msg.textContent = '';
@@ -1354,9 +1574,16 @@ document.addEventListener('click', function(e){
   });
 
   delsel.addEventListener('click', function(){
-    var hs = chosen().map(function(c){ return c.value; });
+    var hs = sel.slice();
     if (!hs.length) return;
-    if (!confirm('确定删除选中的 ' + hs.length + ' 条？删除后无法撤销。')) return;
+    // 隔页选的东西不在眼前，确认框里必须把这件事说出来。
+    // 只报总数的话，人是按「我这页选了三条」的印象去点确定的
+    var here = onPage();
+    var away = hs.filter(function(h){ return here.indexOf(h) < 0; }).length;
+    var ask = '确定删除选中的 ' + hs.length + ' 条？'
+              + (away ? ('其中 ' + away + ' 条不在当前页。') : '')
+              + '删除后无法撤销。';
+    if (!confirm(ask)) return;
     post({mode:'hashes', hashes:hs});
   });
 
@@ -1369,6 +1596,7 @@ document.addEventListener('click', function(e){
           src: meta('filter-src'), alive: meta('filter-alive'),
           kind: meta('filter-kind'), res: meta('filter-res')});
   });
+  syncBoxes();     // 翻页过来的那一页，勾选框要按集合重新打上
   refresh();
 })();
 
@@ -1564,13 +1792,20 @@ document.addEventListener('keydown', function(e){
 def page(title, body, q="", sort="relevance", minsz="", stats=None,
          sources=(), src="", editable=False, alive=False, show_peers=False,
          kind="", res="", show_parse=False, kind_counts=None, res_counts=None,
-         back="", nav="search"):
-    kind_counts = kind_counts or {}
-    res_counts = res_counts or {}
+         back="", nav="search", expand=False, editing=False):
+    # 这两个不做 `or {}` 归一：None 是「当前筛选下数不出来」，{} 是「每档都是
+    # 零条」，抹平之后下拉会把所有选项都藏掉。opts_n 分开处理这两种情况。
+    # 不带 counts 调 page() 的那几处（错误页、任务面板）都是 show_parse=False，
+    # 根本不渲染这两个下拉，默认值取什么都无所谓
     # 编辑入口只在「这一页真有行可编辑」时才出现。空库、无匹配、详情页、
     # 任务面板都不给，按了也没东西可选
+    # 编辑状态跟着 URL 走（?edit=1），所以按钮的初始标签由服务端定，不能写死。
+    # 写死的话带 edit=1 打开的页面会显示「编辑列表」，而勾选框已经是展开的
+    editing = editing and editable
     edit_btn = ('<button id="selmode" class="editlist" type="button" '
-                'aria-pressed="false">编辑列表</button>') if editable else ""
+                'aria-pressed="%s">%s</button>'
+                % ("true" if editing else "false",
+                   "退出编辑" if editing else "编辑列表")) if editable else ""
     opts = lambda items, cur: "".join(
         '<option value="%s"%s>%s</option>'
         % (esc(v), " selected" if v == cur else "", esc(label))
@@ -1600,6 +1835,13 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
             # 在界面上就没有对应项了，看起来像筛选凭空消失
             out = []
             for v, label in items:
+                if counts is None:
+                    # 当前筛选下数不出来（超时或条数过多）。选项照列，
+                    # 只是不带数字——藏掉选项等于替人做了「这里没东西」的判断，
+                    # 而我们恰恰不知道有没有
+                    out.append('<option value="%s"%s>%s</option>'
+                               % (esc(v), " selected" if v == cur else "", esc(label)))
+                    continue
                 n = counts.get(none_key if v == NONE_KIND else v, 0)
                 if v and not n and v != cur:
                     continue
@@ -1649,7 +1891,7 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
     # 回来的那个「本地搜索」链接不用带：它指向 /，而 / 会用 LAST_VIEW
     # 把人送回上一次真正看过的那一屏，连页码都在
     task_qs = qs(q=q, sort=sort, min=minsz, src=src, kind=kind, res=res,
-                 alive="1" if alive else "")
+                 alive="1" if alive else "", expand="1" if expand else "")
     task_qs = "" if task_qs == "/" else task_qs
     # 导航只有一个按钮，固定写「任务」，固定去任务面板——它只有这一个功能，
     # 不做成随页面换名字的切换键。回列表不需要它：旁边那个搜索按钮就是，
@@ -1658,8 +1900,15 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
     # 在任务面板上它指向当前这一页，点了相当于刷新。视觉上不做区分——
     # 页头在每一页都长得一样是更要紧的事——但标上 aria-current，
     # 用读屏的人才知道自己已经在这儿了。
+    #
+    # --no-tasks 时整个按钮不渲染。以前它一直在，而接口那边早就 403 了，
+    # 等于在页头最显眼的位置摆了个按下去只会报错的开关。
+    #
+    # 去掉它不用动样式，搜索按钮自己就贴到右边：搜索框是 flex:1 1 280px，
+    # 这一行剩下的宽度全被它吃掉，排在最后的元素必然顶在行尾。
     nav_html = ('<a class="go" href="/tasks%s"%s>任务</a>'
-                % (esc(task_qs), ' aria-current="page"' if nav == "tasks" else ""))
+                % (esc(task_qs), ' aria-current="page"' if nav == "tasks" else "")
+                ) if TASKS[0] else ""
 
     return """<!doctype html>
 <html lang="zh-CN"><head>
@@ -1674,7 +1923,7 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
 <meta name="filter-res" content="%s">
 <title>%s</title><link rel="stylesheet" href="/style.css?v=%s">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-</head><body>
+</head><body%s>
 <header><div class="wrap">
   <h1 class="sr">本地搜索</h1>
   <form action="/" method="get" role="search">
@@ -1698,6 +1947,7 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
 </body></html>""" % (esc(CSRF[0]), esc(q), esc(minsz), esc(src),      # 七个 meta
                      "1" if alive else "", esc(kind), esc(res),
                      esc(title), BUILD,                               # title、样式版本
+                     ' class="selmode"' if editing else "",           # 编辑状态
                      esc(q), MAX_QUERY, nav_html,                     # 搜索框、导航
                      opts(order_label, sort), opts(SIZE_LABEL, minsz),
                      kind_sel, res_sel, src_sel,
@@ -1707,40 +1957,50 @@ def page(title, body, q="", sort="relevance", minsz="", stats=None,
 def render_results(rows, q, page_no, has_next, sort, minsz, src="",
                    total_matching=0, count_capped=False, can_delete=True,
                    alive=False, show_peers=False, kind="", res="",
-                   show_parse=False):
+                   show_parse=False, expand=False, editing=False):
     # 详情页链接上挂着当前这一屏的筛选。算一次，所有行共用
     detail_qs = qs(q=q, sort=sort, min=minsz, src=src, kind=kind, res=res,
-                   alive="1" if alive else "", page=page_no)
+                   alive="1" if alive else "", expand="1" if expand else "",
+                   edit="1" if editing else "", page=page_no)
     detail_qs = "" if detail_qs == "/" else detail_qs
     items = []
     for r in rows:
         link = magnet(r["infohash"], r["name"])
+        dupes = r.get("dupes") or []
+        # 折起来的那几条不单独占一行，但它们的 infohash 得跟着勾选框走：
+        # 不然在编辑状态下勾一条删掉，剩下的重复会顶上来，看着像没删掉。
+        # 值里是逗号分隔的一串，前端拆开再发
+        pick_val = ",".join([r["infohash"]] + dupes)
+        dupe_cell = ('<span class="dupe" title="同名同体积的重复发布，已折起">'
+                     '+%d 条同名</span>' % len(dupes)) if dupes else ""
         items.append(
             '<li><div class="row1">'
             '%s'
             '<span class="name"><a href="/t/%s%s">%s</a></span>'
             '<span class="size">%s</span></div>'
             '<div class="row2">'
-            '%s<span>%d 个文件</span><span>%s</span>%s'
+            '%s<span>%d 个文件</span><span>%s</span>%s%s'
             '<span class="heat" title="被 announce %d 次"><i style="width:%d%%"></i></span>'
             '<span class="hash">%s</span>'
             '<a href="%s">打开磁力链</a>'
             '<button class="copy" data-magnet="%s" type="button">复制</button>'
             '</div></li>'
             % (('<input type="checkbox" class="pick" value="%s" aria-label="选中">'
-                % esc(r["infohash"])) if can_delete else "",
+                % esc(pick_val)) if can_delete else "",
                esc(r["infohash"]), esc(detail_qs), esc(r["name"]),
                esc(human(r["size"])),
                tags_cell(r) if show_parse else "",
                r["nfiles"], esc(ago(r["last_seen"])),
                peers_cell(r.get("peers"), r.get("checked_at")) if show_peers else "",
+               dupe_cell,
                r["hits"], heat_width(r["hits"]),
                esc(r["infohash"][:16]), esc(link), esc(link)))
 
     pager = []
     # 翻页要把当前所有筛选条件都带上，少带一个就是「翻到第二页筛选没了」
     keep = dict(q=q, sort=sort, min=minsz, src=src, kind=kind, res=res,
-                alive="1" if alive else "")
+                alive="1" if alive else "", expand="1" if expand else "",
+                edit="1" if editing else "")
     if page_no > 1:
         pager.append('<a href="%s">← 上一页</a>' % esc(qs(page=page_no - 1, **keep)))
     if has_next:
@@ -1764,6 +2024,9 @@ def render_results(rows, q, page_no, has_next, sort, minsz, src="",
                '<label class="all"><input type="checkbox" id="pickall"> 全选本页</label>'
                '<button id="delsel" class="danger" type="button" disabled>删除选中</button>'
                '<button id="delall" class="danger ghost" type="button">删除%s</button>'
+               # 选中可以跨页攒，所以「选了多少、有多少不在眼前」得一直摆着看。
+               # 等到点删除时才在确认框里第一次说，已经晚了
+               '<span id="selnote" class="selnote"></span>'
                '<span id="delmsg"></span></div>' % esc(scope))
     # 工具条和列表包在同一张卡片里，翻页条留在卡片外面：
     # 前两者是列表本身，翻页是离开这份列表的动作，不该被框进去
@@ -1782,12 +2045,25 @@ EMPTY_DB = """<div class="empty">
    在 NAT 后面收获会少很多。</p>
 </div>"""
 
+# 用户版（--no-tasks）看到的同一张页面。面板进不去，命令行也多半不在他手上——
+# 把上面那套引导原样给他，等于列一串他一条都做不到的事
+EMPTY_DB_USER = """<div class="empty">
+<p>索引还是空的，现在搜什么都不会有结果。</p>
+<p>等管理员往里加了内容再来。</p>
+</div>"""
+
 # 空手进来（地址栏就是一个 /，没带任何查询串）时给的页面。
 # 一上来就把整库铺开，既慢又没给人任何方向感；这里只留两条路。
 LANDING = """<div class="empty">
 <p>上面搜点什么，中英文都行。想先看看库里都有什么，<b>搜索框留空直接按搜索</b>
    就是整库翻一遍，上面那排筛选照样管用。</p>
 <p>往里加内容去<a href="/tasks">任务面板</a>，本地扫描、Jackett 导入、DHT 爬虫都在那儿。</p>
+</div>"""
+
+# 用户版少的就是「往里加内容」那一段，剩下这段讲怎么搜，两版都用得上
+LANDING_USER = """<div class="empty">
+<p>上面搜点什么，中英文都行。想先看看库里都有什么，<b>搜索框留空直接按搜索</b>
+   就是整库翻一遍，上面那排筛选照样管用。</p>
 </div>"""
 
 
@@ -1919,7 +2195,7 @@ def peers_line(r):
     peers = r.get("peers", -1)
     if peers is None or peers < 0:
         return ('还没测过 —— 到<a href="/tasks">任务面板</a>点「实测做种情况」，'
-                '它会去 DHT 上真查一遍')
+                '它会去 DHT 上真查一遍') if TASKS[0] else '还没测过'
     when = ago(r.get("checked_at") or 0) if r.get("checked_at") else "时间不明"
     if peers == 0:
         return ('<b>%s</b>测的时候一个人都没有，多半是死种' % esc(when))
@@ -1961,11 +2237,14 @@ def render_detail(r):
                  '这会让对方知道你的 IP。不点就不会有任何对外请求。</p>'
                  '<div id="coverbox"></div></div>' % esc(url))
 
-    table = ("<table>%s</table>" % rows) if files else (
-        '<p class="nofiles">这条没有文件列表。Torznab 协议只给标题、体积和磁力链，'
-        '不提供文件清单，所以从 Jackett 导入的条目默认没有。'
-        '到<a href="/tasks">任务面板</a>点「补全文件列表」，'
-        '可以用 infohash 去 DHT 把真实元数据取回来。</p>')
+    # 前半句解释「为什么这条没有文件列表」，两版都该说；
+    # 后半句是让人去按个按钮，用户版没有那个按钮，就不说
+    nofiles = ('<p class="nofiles">这条没有文件列表。Torznab 协议只给标题、体积和磁力链，'
+               '不提供文件清单，所以从 Jackett 导入的条目默认没有。'
+               + ('到<a href="/tasks">任务面板</a>点「补全文件列表」，'
+                  '可以用 infohash 去 DHT 把真实元数据取回来。' if TASKS[0] else "")
+               + '</p>')
+    table = ("<table>%s</table>" % rows) if files else nofiles
     note = ""
     if files and len(files) < r["nfiles"]:
         note = ('<p style="color:var(--muted);font-size:12px;margin:10px 0 0">'
@@ -2252,8 +2531,15 @@ class Handler(BaseHTTPRequestHandler):
                       sources=list_sources(conn), src=src, alive=alive,
                       show_peers=show_peers, kind=kind, res=res,
                       show_parse=show_parse,
-                      kind_counts=facet_counts(conn, "kind") if show_parse else {},
-                      res_counts=facet_counts(conn, "res") if show_parse else {})
+                      expand=one("expand") == "1",
+                      editing=one("edit") == "1",
+                      # 各自不带自己那一维，理由见 facet_counts
+                      kind_counts=facet_counts(conn, "kind", q, min_bytes, src,
+                                               alive, "", res)
+                      if show_parse else {},
+                      res_counts=facet_counts(conn, "res", q, min_bytes, src,
+                                              alive, kind, "")
+                      if show_parse else {})
         return (q, sort, minsz, min_bytes, page_no, src, alive, kind, res), common
 
     def page_search(self, one, has_query=True):
@@ -2268,21 +2554,36 @@ class Handler(BaseHTTPRequestHandler):
         # 拿它判空会把人送回「索引还是空的」那张引导页
         if not st["count"] and not has_any_rows(conn):
             # 空库仍然走老逻辑：不管之前看过什么，没东西可看就是没东西可看
-            body = EMPTY_DB % (esc(py_cmd()), esc(self.db_path),
-                               esc(py_cmd()), esc(self.db_path))
+            body = (EMPTY_DB % (esc(py_cmd()), esc(self.db_path),
+                                esc(py_cmd()), esc(self.db_path))
+                    ) if TASKS[0] else EMPTY_DB_USER
         elif not has_query:
             # 守一道：qs() 在参数全为默认时会返回 "/"，真跳过去就是自己转自己。
             # 眼下 sort 恒有值走不到这儿，但别把这个前提交给以后的自己
-            if LAST_VIEW[0].startswith("?"):
+            if SINGLE_USER[0] and LAST_VIEW[0].startswith("?"):
                 return self.redirect(LAST_VIEW[0])
-            body = LANDING
+            body = LANDING if TASKS[0] else LANDING_USER
         else:
             # 记下这一眼看的是什么，下次空手回到 / 就送回这里。
-            # 搜索和浏览一视同仁，都是「我当时在看的东西」
-            LAST_VIEW[0] = qs(q=q, sort=sort, min=minsz, src=src, kind=kind,
-                              res=res, alive="1" if alive else "", page=page_no)
-            rows, has_next = do_search(conn, q, page_no, sort, min_bytes,
-                                       source=src, alive=alive, kind=kind, res=res)
+            # 搜索和浏览一视同仁，都是「我当时在看的东西」。
+            # 对外开放时连记都不记——记下来没人读，只是白留着别人的查询词
+            if SINGLE_USER[0]:
+                LAST_VIEW[0] = qs(q=q, sort=sort, min=minsz, src=src, kind=kind,
+                                  res=res, alive="1" if alive else "", page=page_no)
+            # 只有排除词（`-枪版`）时不查：FTS 要至少一个正向词，
+            # 否则就是「全库减去它」，几百万条，翻不动也没意义。
+            # 当没给查询词处理是对的，但得在这里截住——交给 do_search 的话
+            # 它会当成「没有关键词」去浏览全部，用户打的那个词被静默吃掉
+            only_neg = (bool(q) and not build_match(q)
+                        and any(e for e, _ph, _t in split_query(q)))
+            rows, has_next = (([], False) if only_neg else
+                              do_search(conn, q, page_no, sort, min_bytes,
+                                        source=src, alive=alive, kind=kind,
+                                        res=res))
+            expand = common["expand"]
+            folded = 0
+            if rows and not expand:
+                rows, folded = fold_dupes(rows)
             if rows:
                 # 这个数有两处要用：浏览模式那行说明，和编辑模式下
                 # 「删除当前筛选的全部 N 条」。算一次两处共用——
@@ -2322,24 +2623,46 @@ class Handler(BaseHTTPRequestHandler):
                             '只在最近入库的 %s 条里找。多打一个字就能搜全库。</p>'
                             % format(LIKE_WINDOW, ","))
                 editable = ALLOW_DELETE[0]
+                # 折叠改变了「这一页有几行」，不说一声就是页面自己少了几条。
+                # 入口就放在受影响的地方，不做成筛选行里那种常驻控件——
+                # 没有重复时它一次也不该出现
+                keep = dict(q=q, sort=sort, min=minsz, src=src, kind=kind,
+                            res=res, alive="1" if alive else "", page=page_no)
+                if folded:
+                    head += ('<p class="browsehead">本页有 %d 条是重复发布'
+                             '（同名、同体积、同文件数），已折起。'
+                             '<a href="%s">展开</a></p>'
+                             % (folded, esc(qs(expand="1", **keep))))
+                elif expand:
+                    head += ('<p class="browsehead">重复发布已展开。'
+                             '<a href="%s">折起</a></p>' % esc(qs(**keep)))
                 body = head + render_results(
                     rows, q, page_no, has_next, sort, minsz, src,
                     total_matching=n_match, count_capped=capped,
                     can_delete=ALLOW_DELETE[0], alive=alive, show_peers=show_peers,
-                    kind=kind, res=res, show_parse=show_parse)
+                    kind=kind, res=res, show_parse=show_parse, expand=expand,
+                    editing=common["editing"] and ALLOW_DELETE[0])
+            elif only_neg:
+                body = ('<div class="empty"><p>只给了排除词，没有要搜的词。'
+                        '<code>-枪版</code> 得跟在一个正向的词后面用，'
+                        '比如 <code>黑客帝国 -枪版</code>。</p></div>')
             elif q:
                 body = NO_MATCH % (esc(q), format(st["count"], ","))
             else:
+                # 两句都是「为什么筛出来是零条」加「去按哪个按钮」。
+                # 用户版只保留前半句：解释照给，按钮他没有
                 if alive:
                     hint = ("这个筛选条件下没有实测到还有人做种的条目。"
-                            "库里大部分条目可能根本没测过——"
-                            "去<a href=\"/tasks\">任务面板</a>跑一次「实测做种情况」。")
+                            "库里大部分条目可能根本没测过。")
+                    if TASKS[0]:
+                        hint += "去<a href=\"/tasks\">任务面板</a>跑一次「实测做种情况」。"
                 elif (kind or res) and not_parsed(conn):
                     # 列补上了但还没回填，筛出来必然是零条。
                     # 不说这句的话，看着就像「库里没有剧集」
                     hint = ("这个筛选条件下没有条目——不过库里还有条目没解析过名字，"
-                            "分类和清晰度是空的，筛不出来。"
-                            "去<a href=\"/tasks\">任务面板</a>点一次「解析名字」。")
+                            "分类和清晰度是空的，筛不出来。")
+                    if TASKS[0]:
+                        hint += "去<a href=\"/tasks\">任务面板</a>点一次「解析名字」。"
                 else:
                     hint = "这个筛选条件下没有条目。"
                 body = ('<div class="empty"><p>%s '
@@ -2421,7 +2744,8 @@ def main():
     ap.add_argument("--no-tasks", action="store_true",
                     help="关掉任务面板，网页就不能启动爬虫和导入了")
     ap.add_argument("--no-delete", action="store_true",
-                    help="关掉网页上的删除功能，数据库只读打开")
+                    help="关掉网页上的删除功能。读连接本来就一直是只读的，"
+                         "这个开关管的是那条临时可写连接，加上就永远不开")
     ap.add_argument("-q", "--quiet", action="store_true", help="不打访问日志")
     if ap.epilog:
         ap.epilog = ap.epilog.replace("python3 ", py_cmd() + " ")
@@ -2441,6 +2765,7 @@ def main():
     Handler.quiet = args.quiet
     DB_PATH[0] = args.db
     ALLOW_DELETE[0] = not args.no_delete
+    SINGLE_USER[0] = args.host in ("127.0.0.1", "localhost", "::1")
     # 统计数字先在后台算起来。库大的时候这一次要扫几十秒，
     # 趁人还在切窗口的工夫算完，首页就不用等
     warm_cache()
@@ -2456,10 +2781,22 @@ def main():
     if TASKS[0]:
         print("任务面板：http://%s:%d/tasks 可以直接启动爬虫和导入"
               % (args.host if args.host != "0.0.0.0" else "127.0.0.1", args.port))
-    if args.host not in ("127.0.0.1", "localhost", "::1"):
+    if not SINGLE_USER[0]:
         print("注意：监听在 %s，局域网或公网都能访问到。"
               "这个页面没有任何登录控制，放到公网前请自己加一层认证或反向代理。"
               % args.host, file=sys.stderr)
+        # 对外开着还留着任务面板或删除，和「别人能搜我的库」完全不是一个性质：
+        # 一个是能在这台机器上起进程，一个是能把索引清空。原来两种情况打印的是
+        # 同一句话，真出事的那种反而看不出来
+        risky = ([u"任务面板 —— 能在这台机器上启动进程、列目录"] if TASKS[0] else []) \
+              + ([u"删除功能 —— 能清空整个索引，不可撤销"] if ALLOW_DELETE[0] else [])
+        if risky:
+            print("!! 而且下面这些也一并对外开着：", file=sys.stderr)
+            for r in risky:
+                print("!!   %s" % r, file=sys.stderr)
+            print("!! 能连到这台机器的人都能用，没有任何登录。"
+                  "要么加上 --no-tasks --no-delete（web-user.bat 就是这个配置），"
+                  "要么把 --host 改回 127.0.0.1。", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -142,9 +142,43 @@ def expand_text(text: str) -> str:
     return " ".join(out)
 
 
+# 一个查询词的形状：可选的前导减号，然后要么是一段带引号的短语，要么是一串非空白。
+# 减号只认**词首**这一个位置。写成 `(-?)(\S+)` 而不是到处扫减号，是因为
+# WEB-DL、S01-S10、ImageNet-ILSVRC2012 这些名字里的连字符是内容不是操作符，
+# 拿它们当排除词会把一大批正常查询搞坏。
+_QUERY_TOKEN = re.compile(r'(-?)"([^"]*)"|(-?)(\S+)')
+
+
+def split_query(query: str):
+    """
+    把查询串切成 [(要排除吗, 是短语吗, 文本), ...]。
+
+    引号没闭合、只打了一个减号这类残缺输入不报错，退化成普通词处理——
+    搜索框里的输入天然是半成品，用户打到一半的状态不该弹错误。
+    """
+    out = []
+    for m in _QUERY_TOKEN.finditer(query or ""):
+        if m.group(2) is not None:
+            out.append((bool(m.group(1)), True, m.group(2)))
+        else:
+            out.append((bool(m.group(3)), False, m.group(4)))
+    return out
+
+
 def build_match(query: str, prefix: bool = True) -> str:
     """
     把用户输入变成 FTS5 的 MATCH 表达式，词与词之间是 AND。
+
+    两个操作符：
+
+    - `-词` 排除。`matrix -reloaded`、`-枪版`。减号只在词首算数。
+    - `"短语"` 按相邻匹配。`"the matrix"` 不会命中「matrix」和「the」分散在
+      名字两头的条目。`-"..."` 两个可以叠。
+
+    排除词和普通词用同一套前缀规则（`-1080` 会连 `1080p` 一起排掉）。本来想让
+    排除走精确匹配、少误伤一点，但那样 `1080` 搜得到 1080p、`-1080` 却排不掉
+    1080p，同一个词在加不加减号时行为不一样——这种不一致比多排掉一点更难受，
+    而且排除是用户自己打出来的，不是系统替他做的决定。
 
     拉丁词默认按前缀匹配（`"ubun"*` 能命中 ubuntu）。这不只是为了「打了半个
     单词也能搜到」——更要紧的是 LATIN 把字母数字连在一起当一个词，`1080p`
@@ -166,17 +200,63 @@ def build_match(query: str, prefix: bool = True) -> str:
     终止。也就是说高频词那堵墙（`1080p` 在 600 万条里命中 45 万条）会来得更早。
     网页那边有 QUERY_DEADLINE 兜底，命令行嫌吵或嫌慢就用 --exact 关掉。
     """
+    pos, neg = [], []
+    for excl, phrase, text in split_query(query):
+        e = _term_expr(text, prefix=prefix, phrase=phrase)
+        if e:
+            (neg if excl else pos).append(e)
+    if not pos:
+        # 只给了排除词（`-枪版`）时不猜「那就是全库减去它」——那是个几百万条的
+        # 结果集，翻不动也没意义。当成没给查询词处理，让上层去走浏览全部。
+        return ""
+    expr = " AND ".join(pos)
+    if neg:
+        # `(A AND B) NOT (C OR D)`。括号是必须的：FTS5 里 NOT 的优先级高于 AND，
+        # 不加括号的 `A AND B NOT C` 会被读成 `A AND (B NOT C)`，
+        # 于是只有 B 那一列受排除、A 照样能把条目捞回来。
+        # 只有一项时 _term_expr 已经保证它是原子的，不用再套一层。
+        left = expr if len(pos) == 1 else "(%s)" % expr
+        expr = "%s NOT (%s)" % (left, " OR ".join(neg))
+    return expr
+
+
+def _quote(tok: str) -> str:
+    """双引号在 FTS5 里要用两个双引号转义，否则用户输入能把查询语法带跑偏。"""
+    return '"%s"' % tok.replace('"', '""')
+
+
+def _term_expr(text: str, prefix: bool, phrase: bool) -> str:
+    """
+    一个词（或一段带引号的短语）变成一个 FTS5 子表达式。认不出内容时返回空串。
+
+    短语只在「整段都是中文」或「整段都是拉丁」时才真的按短语查，理由是索引正文的
+    形状：入库时存的是「原串 + 展开串」，而展开串里所有中文二元组排在前面、
+    所有拉丁词排在后面。所以纯中文短语（连续的二元组）和纯拉丁短语（原串里连续的
+    词）都能对上，中英混排的那种在索引里根本不相邻，按短语查必然一条都搜不到。
+    与其给个静默搜不到，不如降级成 AND——结果多一点，但不会骗人。
+    """
+    cjk = CJK_RUN.findall(text)
+    lat = LATIN.findall(text)
+    if phrase and cjk and not lat:
+        toks = []
+        for run in cjk:
+            toks.extend(_bigrams(run))
+        return _quote(" ".join(toks)) if toks else ""
+    if phrase and lat and not cjk:
+        # 短语不加星：`"the matrix"*` 的星只作用在最后一个词上，
+        # 而用户打引号的意思是「就这几个词，一字不差」，加星是在替他放宽。
+        return _quote(" ".join(lat))
+
     terms = []                     # [(词, 要不要加星)]
-    for run in CJK_RUN.findall(query):
+    for run in cjk:
         terms.extend((b, False) for b in _bigrams(run))
-    terms.extend((t, prefix and len(t) >= PREFIX_MIN) for t in LATIN.findall(query))
+    terms.extend((t, prefix and len(t) >= PREFIX_MIN) for t in lat)
     if not terms:
         return ""
-    # 双引号在 FTS5 里要用两个双引号转义，否则用户输入能把查询语法带跑偏。
     # 星号必须写在引号外面：`"ubun"*` 才是前缀查询，`"ubun*"` 是在找一个
     # 真的带星号的词。
-    return " AND ".join('"%s"%s' % (t.replace('"', '""'), "*" if star else "")
-                        for t, star in terms)
+    parts = [_quote(t) + ("*" if star else "") for t, star in terms]
+    return parts[0] if len(parts) == 1 else "(%s)" % " AND ".join(parts)
 
 
 # 名字的权重是文件列表的十倍。
@@ -197,6 +277,64 @@ def build_match(query: str, prefix: bool = True) -> str:
 NAME_WEIGHT = 10.0
 FILES_WEIGHT = 1.0
 BM25 = "bm25(torrents_fts, %s, %s)" % (NAME_WEIGHT, FILES_WEIGHT)
+
+
+# --------------------------------------------------------------------------
+# 自测
+# --------------------------------------------------------------------------
+# 入库展开（expand_text）和查询展开（build_match）必须是同一套规则，
+# 两边错开一点就是「库里明明有、怎么都搜不出来」，而且不报任何错。
+# btparse 那边靠 CASES 守着规则，这边一直没有对应的东西——加前缀、拆两列、
+# 现在又加排除词和短语，每一次都是手工验过就算数。这些断言就是把那些手工验证钉住。
+#
+# 断言写的是**生成的表达式原文**，不是搜索结果。这样不用建库、毫秒级跑完，
+# 而且改动一眼能看出影响了哪条。表达式变了不一定是错，但一定得有人过目。
+QUERY_CASES = [
+    # 基本形：拉丁词加前缀星，短词不加（PREFIX_MIN）
+    ("ubuntu server",        '"ubuntu"* AND "server"*'),
+    ("ub",                   '"ub"'),
+    ("1080",                 '"1080"*'),          # 加了星才搜得到 1080p
+    # 中文走二元组，不加星
+    ("复仇者联盟",            '("复仇" AND "仇者" AND "者联" AND "联盟")'),
+    # 排除词
+    ("matrix -reloaded",     '"matrix"* NOT ("reloaded"*)'),
+    ("1080p -cam -hdts",     '"1080p"* NOT ("cam"* OR "hdts"*)'),
+    ("复仇者 -国语",          '("复仇" AND "仇者") NOT ("国语")'),
+    # 短语：拉丁按原串相邻，中文按二元组相邻
+    ('"the matrix"',         '"the matrix"'),
+    ('"复仇者联盟"',          '"复仇 仇者 者联 联盟"'),
+    ('matrix "web dl" -x265', '("matrix"* AND "web dl") NOT ("x265"*)'),
+    # 中英混排的短语没法按相邻查（索引里它们不相邻），降级成 AND 而不是搜不到
+    ('"the matrix 复仇"',     '("复仇" AND "the"* AND "matrix"*)'),
+    # 只有排除词、空串、光秃秃一个减号：都当没给查询词
+    ("-枪版",                 ""),
+    ("-",                    ""),
+    ("",                     ""),
+    # 注入：用户打的引号和 OR 必须变成普通词，不能变成查询语法
+    ('a"b OR c',             '("a" AND "b") AND "OR" AND "c"'),
+]
+
+EXPAND_CASES = [
+    ("复仇者联盟4", "复仇 仇者 者联 联盟 4"),   # 中文数字粘连，4 要能被单独命中
+    ("The Matrix", "The Matrix"),
+    ("鬼灭之刃 S01E05", "鬼灭 灭之 之刃 S01E05"),
+]
+
+
+def selftest(verbose=False):
+    """返回失败列表。btcheck 会调它，所以不能有 print 以外的副作用。"""
+    bad = []
+    for q, want in QUERY_CASES:
+        got = build_match(q)
+        if got != want:
+            bad.append(("build_match", q, want, got))
+        if verbose:
+            print("  %-24r -> %s" % (q, got or "(空)"))
+    for t, want in EXPAND_CASES:
+        got = expand_text(t)
+        if got != want:
+            bad.append(("expand_text", t, want, got))
+    return bad
 
 
 def fts_two_col(conn, table="torrents_fts") -> bool:
@@ -408,21 +546,36 @@ class Index:
             o = ord(ch)
             return (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF
                     or 0xF900 <= o <= 0xFAFF or 0x3040 <= o <= 0x30FF)
-        toks = [t for t in str(query or "").split() if t]
+        # 只看正向词。`猫 -狗` 的正向部分还是一个单字，该走 LIKE 就得走：
+        # 按整串判的话它有两个 token、第二个长度不为 1，会被判成不用回退，
+        # 于是交给 FTS——而单字在二元组索引里配不上任何东西，静默返回 0 条。
+        # 加一个排除词就把搜索搞哑了，这种坑必须在这里堵住。
+        toks = [t for excl, _ph, t in split_query(query) if not excl and t]
         # 只对「单个中文字」回退。单个拉丁字母交给 FTS 按词匹配更准 ——
         # 用 LIKE 的话，搜 a 会把所有含字母 a 的条目全捞出来，噪音大到没法用。
         return bool(toks) and all(len(t) == 1 and is_cjk(t) for t in toks)
 
     @staticmethod
     def like_clause(query):
-        """返回 (SQL 片段, 参数)。按空白切词，每个词都要出现在名字或文件列表里。"""
-        toks = [t for t in str(query or "").split() if t][:8]
-        if not toks:
+        """
+        返回 (SQL 片段, 参数)。每个词都要出现在名字或文件列表里，`-词` 则要求两边都没有。
+
+        这条路只有单字查询走得到，但排除词照样得认：`猫 -狗` 在 FTS 那边能用、
+        在这边不能用的话，就是同一个搜索框里两种语法，比没有这个功能还糟。
+        短语在这里不用特殊处理——LIKE 本来就是按整个子串匹配的，
+        `"老 友"` 里的空格原样找过去，正好就是相邻的意思。
+        """
+        toks = [(excl, t) for excl, _ph, t in split_query(query) if t][:8]
+        if not toks or all(excl for excl, _t in toks):
             return "", []
         parts, params = [], []
-        for t in toks:
+        for excl, t in toks:
             pat = "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-            parts.append("(t.name LIKE ? ESCAPE '\\' OR t.filelist LIKE ? ESCAPE '\\')")
+            if excl:
+                parts.append("(t.name NOT LIKE ? ESCAPE '\\' "
+                             "AND t.filelist NOT LIKE ? ESCAPE '\\')")
+            else:
+                parts.append("(t.name LIKE ? ESCAPE '\\' OR t.filelist LIKE ? ESCAPE '\\')")
             params += [pat, pat]
         return " AND ".join(parts), params
 
@@ -649,6 +802,15 @@ def cmd_stats(args):
     idx.close()
 
 
+def cmd_test(args):
+    bad = selftest(verbose=args.verbose)
+    n = len(QUERY_CASES) + len(EXPAND_CASES)
+    print("分词与查询自测：%d 条用例，%d 条不通过" % (n, len(bad)))
+    for where, src, want, got in bad:
+        print("  %s(%r)\n    期望 %r\n    实际 %r" % (where, src, want, got))
+    sys.exit(1 if bad else 0)
+
+
 def main():
     try:
         from btcompat import py_cmd, setup_console
@@ -694,6 +856,11 @@ def main():
 
     p = sub.add_parser("stats", help="看看库里有多少东西")
     p.set_defaults(func=cmd_stats)
+
+    p = sub.add_parser("test", help="跑分词和查询构造的自测，不碰数据库")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="把每条查询生成的表达式打出来")
+    p.set_defaults(func=cmd_test)
 
     if ap.epilog:
         ap.epilog = ap.epilog.replace("python3 ", py_cmd() + " ")

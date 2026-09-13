@@ -34,6 +34,7 @@ btimport —— 把外部资源库批量灌进本地索引
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -132,6 +133,40 @@ def http_json(url, retries=3):
             time.sleep(1.5 * (attempt + 1))      # 退避重试，别把对方服务器敲爆
 
 
+def _dotnet_message(detail: str) -> str:
+    """
+    把 Jackett 回的 .NET 异常串压成一句人话。
+
+    Jackett 出错时把整个 C# 异常链塞进 Torznab 的 `description` 属性里，
+    还是 HTML 转义过的。原样打出来长这样（真实样本，为了看清楚截断了）：
+
+        Jackett.Common.IndexerException: Exception (52bt): Got redirected to
+        another domain. Try changing the indexer URL to https://www.52btbt.icu/.
+        &#xD;&#xA; ---&gt; System.Exception: Parse error&#xD;&#xA; ---&gt;
+        Jackett.Common.ExceptionWithConfigData: ...&#xD;&#xA;   at
+        Jackett.Common.Indexers.Definitions.CardigannIndexer.CheckIfLogin...
+
+    有用的信息是第一句，剩下二十行是 C# 调用栈。堆栈对使用者没有意义——
+    要看的话 Jackett 自己的日志里本来就有全份，这里留着只会把那一句盖住。
+
+    三步：先反转义（`&#xD;&#xA;` 是回车换行），再切到第一个堆栈边界为止，
+    最后剥掉前面那串异常类名。类名用正则剥而不是按冒号切，
+    因为消息本身就含冒号——`https://` 里那个一切就散。
+    """
+    s = html.unescape(detail or "")
+    # 切到第一个堆栈边界。` ---> ` 是内层异常，`   at ` 是栈帧
+    for sep in ("\r", "\n", " ---> ", "   at "):
+        s = s.split(sep, 1)[0]
+    # 剥掉 `Jackett.Common.IndexerException: ` 这样的类名，可能套好几层
+    for _ in range(4):
+        t = re.sub(r"^[\w.]+(?:Exception|Error):\s*", "", s)
+        t = re.sub(r"^Exception \([^)]*\):\s*", "", t)
+        if t == s:
+            break
+        s = t
+    return s.strip()
+
+
 def http_text(url, retries=2):
     for attempt in range(retries):
         try:
@@ -157,8 +192,17 @@ def http_text(url, retries=2):
                     detail = str(obj.get("error") or obj.get("result") or "")
                 except (ValueError, AttributeError):
                     detail = re.sub(r"<[^>]+>", " ", body).strip()[:160] if body.strip() else ""
+            detail = _dotnet_message(detail)
             msg = "HTTP %s%s" % (e.code, ("：" + detail) if detail
                                  else "（Jackett 没给出原因）")
+            # Jackett 里存的站点地址过期了，对方 301 到新域名，
+            # Cardigann 认不出返回的页面就抛 Parse error。这句自己会带上新地址
+            m2 = re.search(r"changing the indexer URL to (\S+)", detail)
+            if m2:
+                msg += ("\n  这个站换域名了，改 Jackett 里的地址，不是改这边："
+                        "打开 http://127.0.0.1:9117 找到该站 → Configure →"
+                        "把 Site Link 改成 %s → 保存 → Test。"
+                        % m2.group(1).rstrip("."))
             if "Unknown indexer" in detail:
                 wrong = detail.split(":", 1)[-1].strip()
                 msg += ("\n  索引站 id 区分大小写，Jackett 的 id 全是小写。"
@@ -215,14 +259,23 @@ class Writer:
         """
         记下封面地址。只存地址，不下载图片 ——
         取不取图由用户在详情页点一下决定，不点就不会有任何对外请求。
+
+        **必须在 add() 之后调**：这是一条 UPDATE，行还不存在就命中 0 行。
+
+        和 add 共用同一把锁。IA 那条路是 8 个线程跑的，不加锁的话两个线程会同时
+        看到 _cover_ready 是 False、同时去 ALTER TABLE，后到的那个撞上
+        「duplicate column name」抛异常——而调用它的 work() 外面是个
+        `except Exception: bad += 1`，于是这一条只会体现成计数里多了个「无效」。
         """
         if not url or not str(url).startswith(("http://", "https://")):
             return
-        if not self._cover_ready:
-            self.ensure_cover(self.idx.db)
-            self._cover_ready = True
-        self.idx.db.execute("UPDATE torrents SET cover=? WHERE infohash=? AND cover=''",
-                            (str(url)[:500], infohash.lower()))
+        with self.lock:
+            if not self._cover_ready:
+                self.ensure_cover(self.idx.db)
+                self._cover_ready = True
+            self.idx.db.execute(
+                "UPDATE torrents SET cover=? WHERE infohash=? AND cover=''",
+                (str(url)[:500], infohash.lower()))
 
     def add(self, infohash, name, size=0, nfiles=0, files=(), source="import"):
         if not infohash or not HEX40.match(infohash):
@@ -374,10 +427,14 @@ def cmd_ia(args, writer):
         try:
             d = ia_item_detail(ident)
             if d:
-                if d.get("cover"):
-                    writer.set_cover(d["infohash"], d["cover"])
+                # 顺序要紧：set_cover 是一条 UPDATE，行还没插进去的话它命中 0 行，
+                # 封面就这么静默丢了。原先是反过来写的，结果新导入的条目
+                # 一条封面都存不下来，只有第二次重复导入同一批才会写上——
+                # 而那时候人早就以为「档案馆没给封面」了。
                 writer.add(d["infohash"], d["name"], d["size"], d["nfiles"],
                            d["files"], source="ia")
+                if d.get("cover"):
+                    writer.set_cover(d["infohash"], d["cover"])
         except Exception:
             writer.bad += 1
         finally:

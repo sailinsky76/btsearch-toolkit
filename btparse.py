@@ -54,7 +54,7 @@ import time
 
 # 规则版本号。改了规则就 +1，backfill 会据此认出「这条是旧规则解析的」并重跑。
 # 没有这个号的话，唯一的办法是全库重扫，或者干脆不管、让新旧规则的结果混在库里。
-PARSE_VERSION = 1
+PARSE_VERSION = 2
 
 # 分类的取值和界面上的说法。存进库的是左边那个 ascii 串，
 # 中文只在界面上出现——库里存中文，将来改说法就得动数据。
@@ -72,7 +72,12 @@ RES_TEXT = dict(RES_LABEL)
 MEDIUM_TEXT = {"remux": "Remux", "bluray": "BluRay", "webdl": "WEB-DL",
                "webrip": "WEBRip", "web": "WEB", "hdtv": "HDTV",
                "dvd": "DVD", "hdrip": "HDRip", "cam": "枪版"}
-CODEC_TEXT = {"x265": "x265", "x264": "x264", "av1": "AV1", "vp9": "VP9",
+# x264 和 H.264 不是一回事：前者是编码器，后者是格式。原先 avc 也归到 x264，
+# 于是 `...BluRay.REMUX.AVC` 显示成「Remux · x264」——而 remux 恰恰是原封不动
+# 拆封装、没有重新编码的那种，说它用 x264 压过是错的。名字里写了哪个就显示哪个。
+# 这两组只影响显示，codec 不进库，所以拆开没有迁移代价。
+CODEC_TEXT = {"x265": "x265", "hevc": "HEVC", "x264": "x264", "h264": "H.264",
+              "av1": "AV1", "vp9": "VP9",
               "xvid": "XviD", "divx": "DivX", "mpeg2": "MPEG-2"}
 
 
@@ -121,9 +126,13 @@ _MEDIUM_RULES = [
     ("cam",    re.compile(r"(?<![a-z])(?:cam ?rip|camrip|cam|telesync|hdts)(?![a-z])")),
 ]
 
+# 编码器写法（x264/x265）排在格式写法（H.264/AVC/HEVC）前面：
+# 名字里两个都写的时候，编码器那个信息量更大。
 _CODEC_RULES = [
-    ("x265",  re.compile(r"(?<![a-z0-9])(?:x ?265|h ?265|hevc)(?![a-z0-9])")),
-    ("x264",  re.compile(r"(?<![a-z0-9])(?:x ?264|h ?264|avc)(?![a-z0-9])")),
+    ("x265",  re.compile(r"(?<![a-z0-9])x ?265(?![a-z0-9])")),
+    ("x264",  re.compile(r"(?<![a-z0-9])x ?264(?![a-z0-9])")),
+    ("hevc",  re.compile(r"(?<![a-z0-9])(?:h ?265|hevc)(?![a-z0-9])")),
+    ("h264",  re.compile(r"(?<![a-z0-9])(?:h ?264|avc)(?![a-z0-9])")),
     ("av1",   re.compile(r"(?<![a-z0-9])av1(?![a-z0-9])")),
     ("vp9",   re.compile(r"(?<![a-z0-9])vp9(?![a-z0-9])")),
     ("xvid",  re.compile(r"(?<![a-z0-9])xvid(?![a-z0-9])")),
@@ -176,11 +185,23 @@ _DIM = re.compile(r"(?<!\d)\d{3,4} ?x ?\d{3,4}(?!\d)")
 _GROUP_TAIL = re.compile(r"-([a-z0-9_@]{2,20})\s*$", re.I)
 _GROUP_HEAD = re.compile(r"^\s*[\[【]([^\]】]{2,20})[\]】]")
 
+# 游戏线索分两档，因为可信度差得很远。
+#
+# 这一档是「不可能是别的东西」的词：没有哪部电影叫 FitGirl，没有哪张专辑叫 .xci。
+# 它们出现在名字的任何位置都算数。
 _GAME_WORDS = re.compile(
-    r"(?<![a-z])(?:repack|fitgirl|dodi|codex|plaza|skidrow|reloaded|razor1911|"
-    r"elamigos|steamrip|empress|tenoke|goldberg|gog|nsp|xci|nsw|"
+    r"(?<![a-z])(?:fitgirl|dodi|elamigos|steamrip|goldberg|gog|nsp|xci|nsw|"
     r"ps[1-5]|psp|psvita|xbox360|xbox|wii|wiiu|switch|emulator)(?![a-z])|"
     r"免安装|绿色版游戏|单机游戏|游戏合集")
+
+# 这一档是破解组的名字，而它们同时都是普通英文词。拿来匹配整个名字的话，
+# `The.Matrix.Reloaded.2003.1080p.BluRay.x264` 直接判成游戏——实测过，
+# 文件列表里全是 .mkv 也拦不住，因为游戏词原先无条件排在文件列表证据前面。
+# 所以这一档只在**结尾 -GROUP 的位置**上算数：那是发布组该待的地方，
+# 出现在片名中间的 Reloaded 就只是个单词。
+_GAME_GROUPS = frozenset(
+    "codex plaza skidrow reloaded razor1911 empress tenoke "
+    "hoodlum prophet flt rune tinyiso darksiders".split())
 # linux 前面允许粘字母：rockylinux、linuxmint 这类发行版名字是一个整词，
 # 卡死左边界就一个都认不出来。iso 放在这儿是因为它作为扩展名不投票
 # （什么都可能是），但写在名字里、而且前面几档都没命中时，软件是最好的猜测——
@@ -198,8 +219,12 @@ _MUSIC_WORDS = re.compile(
 _BOOK_WORDS = re.compile(
     r"(?<![a-z])(?:epub|mobi|azw3|azw|djvu|cbz|cbr|kindle|ebook|pdf)(?![a-z])|"
     r"电子书|扫描版|全套书|漫画")
+# repack 两边都没有，是故意的。影视发布里它是「重新压制」，游戏里是「重打包」，
+# 单独出现时什么也证明不了。原先它同时写在游戏和影视两档里，游戏那档排在前面
+# 先命中，于是每一条带 REPACK 的影视发布都被判成了游戏——而 REPACK 在 scene
+# 命名里极常见，这不是偶发误判，是成批的。中性词就该谁也不投。
 _VIDEO_WORDS = re.compile(r"(?<![a-z])(?:mkv|mp4|avi|rmvb|m2ts|hdr|dolby|"
-                          r"vision|sdr|imax|proper|repack)(?![a-z])|"
+                          r"vision|sdr|imax|proper)(?![a-z])|"
                           r"国语|中字|双语|字幕|蓝光|高清")
 
 # 文件扩展名 -> 大类。这是最硬的证据：名字是人写的，文件列表是真的。
@@ -363,6 +388,12 @@ def _group(raw: str, media: bool = True) -> str:
     return tail
 
 
+def _game_group_tail(raw: str) -> bool:
+    """名字结尾的 -GROUP 是不是破解组。只认这一个位置，理由见 _GAME_GROUPS。"""
+    m = _GROUP_TAIL.search((raw or "").strip())
+    return bool(m and flatten(m.group(1)).strip() in _GAME_GROUPS)
+
+
 def parse(name: str, filelist: str = "") -> dict:
     """
     解析一条。只读不写，没有副作用，随便调。
@@ -377,14 +408,22 @@ def parse(name: str, filelist: str = "") -> dict:
     season, episode, tv_strong, tv_weak = _season_episode(flat, raw)
     year = _year(flat, raw)
 
-    # 分类：先看文件列表（硬证据），再看名字里的词。
-    # 游戏关键词排在文件列表前面，因为游戏包里多半是 exe 和一堆 bin，
-    # 按扩展名投票会投成「软件」，而名字里写着 FitGirl / RePack 的基本跑不掉。
-    fam = ""
-    if _GAME_WORDS.search(flat):
-        fam = "game"
-    if not fam:
-        fam = _family_from_files(filelist)
+    # 分类：文件列表是硬证据，先问它。名字里的词只在它没话说时才作数。
+    fam = _family_from_files(filelist)
+
+    # 游戏这一档要单独处理。游戏包里多半是 exe 加一堆 bin，按扩展名投票会投成
+    # 「软件」，所以名字里的游戏线索必须能推翻「软件」——这是原先把游戏词排在
+    # 最前面的理由，理由本身是对的，放的位置错了。它只该推翻「软件」和「没结论」：
+    # 文件列表里七成以上是 .mkv 的时候，名字里那个词一定是认错了。
+    #
+    # 第二道闸是清晰度/片源/编码。游戏发布不写 1080p、BluRay、x264，影视发布
+    # 几乎一定写。三样里出现任何一样，游戏线索一律不采信——
+    # `Dune.2024.REPACK.1080p.WEB-DL` 和 `The.Switch.2010.1080p.BluRay`
+    # 都是靠这道闸救回来的。
+    if fam in ("", "software") and not (res or medium or codec):
+        if _GAME_WORDS.search(flat) or _game_group_tail(raw):
+            fam = "game"
+
     if not fam:
         if res or codec or medium or _VIDEO_WORDS.search(flat) or tv_strong:
             fam = "video"
@@ -462,7 +501,11 @@ CASES = [
     # ── 剧集 ────────────────────────────────────────────────────
     ("Some.Show.S02E07.2160p.WEB-DL.DDP5.1.HDR.H.265-GROUP", "",
      {"kind": "tv", "res": "2160p", "season": 2, "episode": 7,
-      "codec": "x265", "medium": "webdl", "group": "GROUP"}),
+      "codec": "hevc", "medium": "webdl", "group": "GROUP"}),
+    # 编码器和格式分开报：remux 没有重新编码，说它用 x264 压过是错的
+    ("A.Film.2021.2160p.BluRay.REMUX.AVC.DTS-HD", "",
+     {"codec": "h264", "medium": "remux"}),
+    ("A.Film.2021.1080p.BluRay.x264-GRP", "", {"codec": "x264"}),
     ("The.Office.US.S01E01.1080p.BluRay.x264-SHORTBREHD", "",
      {"kind": "tv", "res": "1080p", "season": 1, "episode": 1,
       "medium": "bluray", "codec": "x264"}),
@@ -546,6 +589,23 @@ CASES = [
     ("Movie.2019.DVD.ISO", "", {"kind": "movie"}),     # 带 iso 的影碟还是影视
     ("Something.2160p.WEB-DL.and.1080p.version", "",
      {"res": "2160p"}),                           # 两个清晰度取高的
+
+    # ── 游戏词抢在文件列表前面那个坑（见 _GAME_GROUPS / parse 的说明）──
+    # 这六条原先全部判成「游戏」，包括文件列表里明摆着是 .mkv 的。
+    ("Dune.Part.Two.2024.REPACK.1080p.WEB-DL.x265-CMRG",
+     "Dune.Part.Two.2024.mkv\nDune.srt", {"kind": "movie"}),
+    ("The.Matrix.Reloaded.2003.1080p.BluRay.x264-AMIABLE",
+     "The.Matrix.Reloaded.2003.mkv", {"kind": "movie"}),
+    ("Some.Show.S01E02.REPACK.1080p.WEB-DL", "ep.mkv", {"kind": "tv"}),
+    ("Oppenheimer.2023.2160p.PLAZA.WEB", "", {"kind": "movie"}),
+    ("Avatar.2009.EXTENDED.1080p.BluRay.x264-Elamigos", "", {"kind": "movie"}),
+    ("The.Switch.2010.1080p.BluRay.x264", "", {"kind": "movie"}),
+    # 反向：真游戏还得判得出来，不能为了修上面那些把这一档修没了
+    ("Cyberpunk.2077.v2.13-FitGirl.Repack", "", {"kind": "game"}),
+    ("Some.Game.Deluxe.Edition-CODEX", "setup.exe\ndata1.bin\ndata2.bin",
+     {"kind": "game"}),                           # 文件列表说「软件」，组名翻盘
+    ("Another.Game.v1.4-SKIDROW", "", {"kind": "game"}),
+    ("Zelda.Tears.of.the.Kingdom.NSP", "", {"kind": "game"}),
 ]
 
 
