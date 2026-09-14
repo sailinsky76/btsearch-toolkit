@@ -647,7 +647,11 @@ def run_pipeline(args):
                 raw, info = fetch_metadata(ih, peer, timeout=args.timeout)
                 store(h, raw, info)
                 return True
-            except (MetaError, OSError, ValueError) as e:
+            except Exception as e:
+                # 接得比需要的宽，是有意的：这个循环的语义是「这个 peer 不行就换
+                # 下一个」，而对面是陌生人，它发来的任何东西都可能触发想不到的
+                # 异常类型。漏掉一种，代价就是剩下的 peer 全部不再试——
+                # 放弃一整个种子，只因为第一个 peer 不怀好意。
                 if "metadata_size" in str(e):
                     mark_peer(peer[0])
                 note_fail(peer, e)

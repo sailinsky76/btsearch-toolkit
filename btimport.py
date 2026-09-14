@@ -279,7 +279,11 @@ class Writer:
 
     def add(self, infohash, name, size=0, nfiles=0, files=(), source="import"):
         if not infohash or not HEX40.match(infohash):
-            self.bad += 1
+            # 这一句原先在锁外面。IA 那条路是 8 个线程跑的，而 `x += 1` 不是
+            # 原子操作（读、加、写三步），并发下会丢计数——末尾那行汇总里
+            # 「跳过 N 条无效」就会比实际少。不影响数据，但那行数字得是真的
+            with self.lock:
+                self.bad += 1
             return False
         with self.lock:
             try:
@@ -436,7 +440,8 @@ def cmd_ia(args, writer):
                 if d.get("cover"):
                     writer.set_cover(d["infohash"], d["cover"])
         except Exception:
-            writer.bad += 1
+            with writer.lock:        # 同上，8 线程下 += 会丢计数
+                writer.bad += 1
         finally:
             done[0] += 1
             if done[0] % 200 == 0:
@@ -1209,8 +1214,30 @@ btindex.py stats 能看到各来源各多少条。
         parser.add_argument("-q", "--quiet", action="store_true",
                             default=argparse.SUPPRESS, help="不逐条打印")
 
-    p = sub.add_parser("ia", help="互联网档案馆")
-    p.add_argument("--query", default="", help="Lucene 语法，如 mediatype:movies")
+    p = sub.add_parser(
+        "ia", help="互联网档案馆",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""--query 用的是 Lucene 语法，写法决定了你会搜到什么：
+
+  title:(奥德赛)                            只匹配标题 —— 通常你要的是这个
+  title:(odyssey) AND mediatype:movies     再按类型收窄
+  collection:(prelinger)                   整个合集
+  subject:(jazz) AND mediatype:audio       按主题词
+  title:(space) AND NOT mediatype:texts    排除书籍
+
+不写字段名的裸关键词（直接写「奥德赛」）会**搜遍所有元数据**：简介、主题词、
+上传者、所属合集，书籍还包括扫描全文。而入库时只存 title 这一个字段，于是
+搜出来的东西里会有一批「名字和文件列表都不含这个词」的条目 —— 它们是靠简介
+或主题词命中的，你在库里看不到那部分。想按名字搜就写 title:(...)。
+
+加 mediatype 收窄很值：档案馆里 texts（书籍）占绝对多数且全文可检索，
+不排掉的话搜任何常见词都会灌进来一大堆书。
+常见取值：movies、audio、texts、software、image、data。
+
+另外文件列表最多存 60 条（nfiles 仍是全量计数），关键词落在第 61 个文件上
+同样存不进来。""")
+    p.add_argument("--query", default="",
+                   help="Lucene 查询，写法见下方说明。想按名字搜用 title:(关键词)")
     add_proxy(p)
     p.set_defaults(func=cmd_ia)
 

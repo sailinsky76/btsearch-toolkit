@@ -165,6 +165,53 @@ def split_query(query: str):
     return out
 
 
+def name_matches(query: str, name: str, prefix: bool = True) -> bool:
+    """
+    只看名字这一列，够不够满足查询里的正向词。
+
+    用来在结果行上区分「名字里就有这个词」和「只是文件列表里提了一嘴」。
+    搜索两列都搜（见 fts_write），所以名字里没有关键词的条目照样会出现在结果里，
+    而看页面的人只能看到名字，于是第一反应是「这条为什么在这」——那个答案
+    要点开详情页翻文件列表才知道。有了这个判断就能在行上直接标出来。
+
+    **规则必须跟着 build_match 走。** 两边错开的后果是标反：明明名字里有这个词，
+    行上却写着「文件名匹配」。所以这里逐条对应 _term_expr 的做法：
+    中文按二元组逐个查（不是把整段当子串——FTS 要的是每个二元组都在，
+    「复仇的仇者」含有「复仇」和「仇者」两个二元组，是真能被「复仇者」命中的），
+    拉丁按词查、够长的按前缀，短语按整段相邻查。
+
+    排除词不参与：能出现在结果里的条目，本来就已经满足了排除条件。
+    """
+    hay = (name or "").lower()
+    words = [w.lower() for w in LATIN.findall(hay)]
+    for excl, phrase, text in split_query(query or ""):
+        if excl:
+            continue
+        cjk, lat = CJK_RUN.findall(text), LATIN.findall(text)
+        if not cjk and not lat:
+            continue                      # 光一个减号之类，没内容
+        if phrase and cjk and not lat:
+            if text.lower() not in hay:    # 纯中文短语要整段相邻
+                return False
+            continue
+        if phrase and lat and not cjk:
+            if " ".join(lat).lower() not in " ".join(words):
+                return False
+            continue
+        for run in cjk:
+            for b in _bigrams(run):
+                if b.lower() not in hay:
+                    return False
+        for t in lat:
+            t = t.lower()
+            if prefix and len(t) >= PREFIX_MIN:
+                if not any(w.startswith(t) for w in words):
+                    return False
+            elif t not in words:
+                return False
+    return True
+
+
 def build_match(query: str, prefix: bool = True) -> str:
     """
     把用户输入变成 FTS5 的 MATCH 表达式，词与词之间是 AND。
@@ -314,6 +361,27 @@ QUERY_CASES = [
     ('a"b OR c',             '("a" AND "b") AND "OR" AND "c"'),
 ]
 
+# name_matches 的规则要跟 build_match 咬住，错开就会在结果行上标反
+NAME_CASES = [
+    ("matrix",        "The.Matrix.1999.1080p.BluRay", True),
+    ("matrix",        "Dev Tools Pack 0",             False),  # 只能是文件列表命中的
+    ("matr",          "The.Matrix.1999",              True),   # 够长，按前缀
+    ("ma",            "The.Matrix.1999",              False),  # 短于 PREFIX_MIN，要精确
+    ("黑客帝国",       "黑客帝国.The.Matrix.1999",       True),
+    ("黑客帝国",       "The.Matrix.1999",              False),
+    # 二元组是逐个查的，不是把整段当子串：FTS 真会这么命中，这里得跟着
+    ("复仇者",         "复仇的仇者",                    True),
+    ("复仇者",         "复仇联盟",                      False),
+    ('"the matrix"',  "The.Matrix.1999",              True),   # 短语要相邻
+    ('"the matrix"',  "Matrix The Movie",             False),
+    ('"复仇者联盟"',    "复仇者联盟4",                   True),
+    ('"复仇者联盟"',    "复仇者与联盟",                   False),
+    ("matrix -reloaded", "The.Matrix.1999",           True),   # 排除词不参与判断
+    ("matrix 2003",   "The.Matrix.1999",              False),  # 多个词要全中
+    ("",              "任何名字",                      True),   # 没给词就无所谓命中位置
+    ("猫",            "小猫咪",                        True),   # 单字走 LIKE 那条路
+]
+
 EXPAND_CASES = [
     ("复仇者联盟4", "复仇 仇者 者联 联盟 4"),   # 中文数字粘连，4 要能被单独命中
     ("The Matrix", "The Matrix"),
@@ -334,6 +402,10 @@ def selftest(verbose=False):
         got = expand_text(t)
         if got != want:
             bad.append(("expand_text", t, want, got))
+    for q, nm, want in NAME_CASES:
+        got = name_matches(q, nm)
+        if got != want:
+            bad.append(("name_matches", "%s / %s" % (q, nm), want, got))
     return bad
 
 
@@ -384,7 +456,11 @@ def parse_size(text) -> int:
     s = str(text).strip()
     if s.isdigit():
         return int(s)
-    m = re.match(r"([\d.]+)\s*([KMGTP])i?B?$", s, re.I)
+    # `[\d.]+` 能放过 `1.2.3` 这种多个小数点的写法，交给 float() 就抛出
+    # 「could not convert string to float」——一句英文的 Python 内部报错，
+    # 而同一个函数对 `abc` 给的是中文提示。同样是看不懂的输入，
+    # 报错该长一个样，所以这里把小数点数目也一起卡掉
+    m = re.match(r"(\d+(?:\.\d+)?)\s*([KMGTP])i?B?$", s, re.I)
     if not m:
         raise ValueError("看不懂的体积写法: %s" % text)
     mult = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5}
@@ -804,7 +880,7 @@ def cmd_stats(args):
 
 def cmd_test(args):
     bad = selftest(verbose=args.verbose)
-    n = len(QUERY_CASES) + len(EXPAND_CASES)
+    n = len(QUERY_CASES) + len(EXPAND_CASES) + len(NAME_CASES)
     print("分词与查询自测：%d 条用例，%d 条不通过" % (n, len(bad)))
     for where, src, want, got in bad:
         print("  %s(%r)\n    期望 %r\n    实际 %r" % (where, src, want, got))

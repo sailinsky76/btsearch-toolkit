@@ -95,7 +95,8 @@ def _query_case_count(here):
     sys.path.insert(0, here)
     try:
         import btindex
-        return len(btindex.QUERY_CASES) + len(btindex.EXPAND_CASES)
+        return (len(btindex.QUERY_CASES) + len(btindex.EXPAND_CASES)
+                + len(btindex.NAME_CASES))
     except Exception:
         return 0
 
@@ -167,13 +168,23 @@ def scan_bat_flags(here):
     脚本换了个版本、参数改了名，.bat 却还是老写法——这种事只有实际运行才会暴露，
     而且报错是 argparse 的 usage 一大堆，不容易一眼看懂。
     """
+    # 起子进程读 --help 是这项检查里唯一的开销，而 14 个 .bat 里同一个脚本
+    # 会被提到好几次（btweb、btmaint、btimport、btmigrate 各两次）。
+    # 同一个 (脚本, 子命令) 的答案不会变，存下来就行
+    seen = {}
+
     def flags(script, sub=None):
+        key = (script, sub)
+        if key in seen:
+            return seen[key]
         cmd = [sys.executable, script] + ([sub] if sub else []) + ["--help"]
         try:
             _, out = run_child(cmd, here)
+            got = set(re.findall(r"(--[a-z0-9][a-z0-9-]*)", out))
         except (OSError, subprocess.SubprocessError):
-            return set()
-        return set(re.findall(r"(--[a-z0-9][a-z0-9-]*)", out))
+            got = set()
+        seen[key] = got
+        return got
 
     SUBS = ("search", "scan", "check", "analyze", "verify", "prune",
             "vacuum", "report", "import")
@@ -298,8 +309,30 @@ def check_cli_flags(here):
     return bad
 
 
+USAGE = """环境自检：把这套工具跑起来要用到的东西逐项试一遍。
+
+    %s btcheck.py            跑全部检查
+    %s btcheck.py --help     只看这段说明
+
+不接受别的参数。检查项是固定的，没有可配的东西。"""
+
+
 def main():
     setup_console()
+    # 必须先认 --help，而且要立刻返回。
+    #
+    # 这个脚本自己就写在 check.bat 里，而 scan_bat_flags 的做法是对每个
+    # .bat 里提到的脚本跑一次 `--help` 去收集它支持的参数——于是自检会起一个
+    # 子进程递归地跑自己，跑满 30 秒被 timeout 杀掉才算完。整个自检 36 秒里
+    # 有 30 秒耗在这一件事上，而且全程不显示任何进展，看着就像卡死了。
+    if any(a in ("-h", "--help", "/?") for a in sys.argv[1:]):
+        print(USAGE % (py_cmd(), py_cmd()))
+        return
+    if sys.argv[1:]:
+        print("btcheck.py 不接受参数：%s" % " ".join(sys.argv[1:]))
+        print(USAGE % (py_cmd(), py_cmd()))
+        sys.exit(2)
+
     print("环境自检   构建 %s" % BUILD)
     print("=" * 66)
 

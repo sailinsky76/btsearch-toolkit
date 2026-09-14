@@ -62,7 +62,26 @@ def bencode(v) -> bytes:
     raise TypeError("bencode 不支持 %r" % type(v))
 
 
-def _bdecode(data: bytes, i: int):
+# 嵌套多深就不认了。这个解析器是递归的，而喂给它的东西全部来自网络上的陌生人：
+# `l` 重复五千次再补五千个 `e`，一个十 KB 的包就能把 Python 的递归栈顶穿，
+# 抛出 RecursionError。
+#
+# 要紧的不是「会抛异常」，而是抛的是**哪一种**异常。各处收包循环接的是
+# `except Exception`，不受影响；但 dhtmeta 里逐个试 peer 的 try_peers 接的是
+# `(MetaError, OSError, ValueError)`，RecursionError 不在其中，会直接冲出那个
+# 循环——于是一个恶意 peer 就能让**剩下的 peer 一个都不再试**，那个种子的元数据
+# 就此放弃。DHT 上确实有人专门干投毒这行（所以这份代码里才有 polluters 那套）。
+#
+# 所以上限放在解析器自己身上，抛 ValueError：调用方本来就在接这个类型，
+# 七个调用点一次全部覆盖，不用去改每一处的 except。
+# 200 层远超真实种子的需要——info 字典最深也就三四层。
+MAX_BDECODE_DEPTH = 200
+
+
+def _bdecode(data: bytes, i: int, depth: int = 0):
+    if depth > MAX_BDECODE_DEPTH:
+        raise ValueError("bencode 嵌套太深（超过 %d 层），当畸形包丢掉"
+                         % MAX_BDECODE_DEPTH)
     c = data[i:i + 1]
     if c == b"i":
         j = data.index(b"e", i)
@@ -71,15 +90,15 @@ def _bdecode(data: bytes, i: int):
         i += 1
         out = []
         while data[i:i + 1] != b"e":
-            v, i = _bdecode(data, i)
+            v, i = _bdecode(data, i, depth + 1)
             out.append(v)
         return out, i + 1
     if c == b"d":
         i += 1
         out = {}
         while data[i:i + 1] != b"e":
-            k, i = _bdecode(data, i)
-            v, i = _bdecode(data, i)
+            k, i = _bdecode(data, i, depth + 1)
+            v, i = _bdecode(data, i, depth + 1)
             out[k] = v
         return out, i + 1
     if c.isdigit():

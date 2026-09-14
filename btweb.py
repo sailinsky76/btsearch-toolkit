@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from btcompat import BUILD, db_uri, py_cmd, setup_console
 from btindex import (BM25, DB_DEFAULT, Index, build_match, human, magnet,
-                     parse_size, split_query)
+                     name_matches, parse_size, split_query)
 from btparse import (CODEC_TEXT, KIND_LABEL, KIND_TEXT, MEDIUM_TEXT,
                      PARSE_VERSION, RES_LABEL, describe, parse as parse_name,
                      se_text)
@@ -1179,6 +1179,13 @@ body.selmode .tools{display:flex}
 .selnote b{color:var(--danger)}
 .selnote a{margin-left:8px}
 
+/* 「这一条是靠文件名命中的」。和 .dupe 同一族的轻量标记，
+   但用虚线边框区分：那个说的是「这行代表几条」，这个说的是「为什么在这」 */
+.viafiles{
+  border:1px dashed var(--line); border-radius:3px;
+  padding:0 5px; color:var(--muted);
+}
+
 /* 折起的重复发布。用边框而不是底色：这一行里已经有做种状态在用颜色了，
    再加一块色就分不清哪个是状态、哪个是计数 */
 .dupe{
@@ -1973,13 +1980,19 @@ def render_results(rows, q, page_no, has_next, sort, minsz, src="",
         pick_val = ",".join([r["infohash"]] + dupes)
         dupe_cell = ('<span class="dupe" title="同名同体积的重复发布，已折起">'
                      '+%d 条同名</span>' % len(dupes)) if dupes else ""
+        # 搜索是名字和文件列表两列一起搜的，所以名字里不含关键词的条目照样会出现。
+        # 不标一下的话，看页面的人只看得到名字，第一反应是「这条为什么在这」，
+        # 而答案要点开详情页翻文件列表才知道。这里手上就有名字和查询词，不用查库
+        why_cell = ("" if not q or name_matches(q, r["name"]) else
+                    '<span class="viafiles" title="名字里没有这个词，是种子内的文件名'
+                    '命中的；排序上名字的权重是文件列表的十倍">文件名匹配</span>')
         items.append(
             '<li><div class="row1">'
             '%s'
             '<span class="name"><a href="/t/%s%s">%s</a></span>'
             '<span class="size">%s</span></div>'
             '<div class="row2">'
-            '%s<span>%d 个文件</span><span>%s</span>%s%s'
+            '%s<span>%d 个文件</span><span>%s</span>%s%s%s'
             '<span class="heat" title="被 announce %d 次"><i style="width:%d%%"></i></span>'
             '<span class="hash">%s</span>'
             '<a href="%s">打开磁力链</a>'
@@ -1992,7 +2005,7 @@ def render_results(rows, q, page_no, has_next, sort, minsz, src="",
                tags_cell(r) if show_parse else "",
                r["nfiles"], esc(ago(r["last_seen"])),
                peers_cell(r.get("peers"), r.get("checked_at")) if show_peers else "",
-               dupe_cell,
+               dupe_cell, why_cell,
                r["hits"], heat_width(r["hits"]),
                esc(r["infohash"][:16]), esc(link), esc(link)))
 
